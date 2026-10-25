@@ -1,0 +1,64 @@
+# Changelog
+
+所有值得用户知道的变更记在这里。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
+
+## 未发布 — 2026-10-23
+
+群记忆正确性与控制台修复（不新增功能、不改对外配置键）：
+
+### 修复
+
+- **写侧改用未截断原文**：积累器合并/备份不再拿读侧 24KB 截断文本当基准；超过 `maxBytes` 的尾部不再每轮丢失，旧版误写进正文的「…已截断」提示会在下次合并时清掉。
+- **水位口径**：`digestedAt` 改为「本轮实际喂给模型的最新消息 ts」，不再用 `Date.now()`（模型调用期间新到的消息不再被误标已消化）。
+- **采样可见**：每群超出 `accumulateMsgPerGroup` / `accumulateMaxChars` 的条数计入 `sampledOut`（日志 + 结果行），不再静默丢弃。
+- **digest 解析 0 条不推水位**：模型把要点写成段落/表格时记 failed、下轮重试，不再当「无新增」跳过。
+- **单轮群数上限可配 + 轮转**：新增 `accumulateMaxGroupsPerRound`（默认 12），配合游标轮转，大号段群不再永久饿死。
+- **合并质量**：同 QQ 重复画像归一、`；**昵称(QQ)**` run-on 拍平、`这轮/本轮` 临时内容丢弃、每节按条数 + 字节预算裁剪（优先保「群里的人」），文件稳定在读取上限内。
+- **`.revisions` 统一保留**：积累器与控制台 `-manual` 备份共用命名/`accumulateRetainRevisions`；死群多余版本每轮收掉。
+- **控制台保存**：保存上限跟随 `maxBytes`；带 `ifMtime` 的乐观并发校验（防止旧编辑器覆盖新积累）；写盘 0600；`dir` 限制在数据目录内；唤醒词里的非群号数字键不再让「群记忆」页整页崩掉；保存后状态自动跟随。
+- **生命周期**：定时器接入 `bot.onDispose()`（新增 bot 能力，向后兼容），插件重载不再叠出第二个 60s 定时器。
+- **文档/注释**：配置参考补 `accumulateMaxGroupsPerRound`、采样/水位口径；开发指南补 `bot.onDispose`；修正「后台会话禁止调用任何工具」等过时注释。
+
+### 测试
+
+- 新增 `test/audit-group-memory-fixes.test.js`（6 条）与 4 条控制台用例；全量 `node --test` 209/209。
+
+## 0.1.1 — 2026-10-21
+
+新增 4 个可选子插件（来自社区 PR #1），并修掉 review 发现的问题。
+
+### 新增
+
+- `anti-repeat`：同一个人同一句话刷屏冷却（超过次数甩一句 + 整线冷却，零 token）。
+- `private-friend-gate`：私聊只回好友（好友列表缓存；拉取失败时 fail-open，不误伤）。
+- `video-read` / `video-link-read`：群视频 / B 站·抖音链接抽帧给模型看（需要本地解析侧车；没装或没起时自动降级）。
+- 控制台对应开关（「唤醒」页防刷屏、「文件与图片」页看视频、「其他」页私聊门禁）。
+
+### 修复（review）
+
+- 移除 `video-read` 的排障 trace（不再写临时日志），并给被引消息加负缓存。
+- `video-link-read` 移除 `blockParserAfterRead`：`link-parser` 在 intercept 阶段已经处理，before-turn 拦不住，原选项语义相反。
+- `video-link-read` 补上缺失的 `onlyWhenAddressed` 配置。
+- `bot.napcat` 契约补充 `friendList / msgById / getFile`；README / 说明书 / 架构文档同步为 13 个子插件。
+
+## 0.1.0 — 2026-10-20
+
+首个公开发布版本：把内部迭代收敛成一个**可安装、开箱即用**的 DSH 插件。
+
+### 新增
+
+- **DSH 原生插件包**：`dsh.bundle.patch` 随包声明，一行挂载；in-process 运行，无需独立进程 / systemd。
+- **微内核 + 9 个子插件**：`gate-wake` / `commands` / `file-transfer` / `persona-voice` / `group-welcome` / `imagegen` / `link-parser` / `stickers` / `group-memory`，目录自动发现、按 order 排序、坏一个不拖垮整体。
+- **五阶段入站管线**：`pre-gate` → `passive-tap` → `intercept` → `wake` → `before-turn`。
+- **唯一出站口**：文本走 `deliver()`、媒体走 `sendMedia()`；自动抽 `[AT:]`、六项脱敏、插件装饰、发送 + 留档。
+- **QQ 控制台**：16 个页签，配置热改（原子写 + 备份 + 失败回滚）；**子插件 ↔ 页面 1:1**（生图凭据归 `imagegen`、人设句池归「句池」、门禁与唤醒归「唤醒」），低频配置统一在「其他」页。
+- **开箱人设**：内置「蓝色大肥鱼」人设 + `_模板.md`，首次启动自动投递；唤醒词与人设词合并生效。
+- **QQ 侧能力**：收/发图片、生图与图生图（`openai-images` / `openai-chat` 两种协议）、群头像、表情包自动收集与发表情、入群欢迎、链接解析（可选侧车）、群记忆注入。
+- **跨平台**：Linux / Windows / macOS；Windows 路径、临时目录、CQ 文件引用、原子写、软链不可用时的人设 copy 降级都在 `platform/` 收口。
+- **CLI**：`node bin/dsh-onebot-qq.mjs init | doctor | import-legacy | persona`。
+- **测试与守卫**：`node --test`（含假 NapCat 端到端）、打包清单守卫、私有信息扫描。
+
+### 说明
+
+- 数据目录默认 `$DSH_HOME/dsh-onebot-qq`；从旧名 `dsh-qq-bot` 升级时**自动沿用旧目录**，无需迁移。
+- 配置里不携带任何真实 QQ 号 / 群号 / 密钥 / 服务器路径；所有示例均为占位值。
