@@ -79,7 +79,9 @@ export default {
     /** 仅主人命令的统一前置；返回 true = 已拒绝并回执 */
     async function denyUnlessMaster(ev, name) {
       if (ev.sender?.isMaster === true) return false
-      await reply(ev, '🙅 这个命令只有主人能用', name)
+      // 非主人：静默吞掉，不回任何字（避免「别人打个 /help 就把机器人叫出来」）
+      ev.stopped = true
+      ev.stopReason = `commands:silent-deny:${name}`
       return true
     }
 
@@ -161,9 +163,10 @@ export default {
 
     // ── /help（任意人） ──────────────────────────────────────────
     define('help', {
-      permission: 'any',
+      permission: 'master',
       description: '本帮助',
       async run(ev) {
+        if (await denyUnlessMaster(ev, 'help')) return
         const lines = ['📖 可用命令:']
         const source = bot.commands instanceof Map && bot.commands.size ? bot.commands : registry
         for (const [name, def] of source) {

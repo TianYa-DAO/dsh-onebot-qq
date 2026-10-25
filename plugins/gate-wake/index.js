@@ -69,6 +69,10 @@ const configSchema = {
     hint: 'QQ 号列表（逗号分隔）。非空时：只有名单内的 QQ 和主人能使用本机（群聊 + 私聊都生效）；空 = 不限制。'
       + '和「群内白名单」的区别：这个限制所有群和私聊，群内白名单只限制某一个群。适合「只给自己和几个朋友用」的场景。',
   },
+  alwaysReplyGroups: {
+    type: 'group', default: [], group: '唤醒', label: '这些群有消息必回',
+    hint: '群号列表（逗号分隔）。命中的群不再要求 @ 或唤醒词，任何消息都进模型。\n⚠️ 会明显费 token，只给一两个群开。',
+  },
   groupAtRequired: { type: 'bool', default: true, group: '唤醒', label: '群聊必须被叫才回', hint: '开：群里必须 @ 它或叫到唤醒词才回；关：没人叫也会接话（容易吵，一般保持开）。' },
   groupFollowUpMs: {
     type: 'int', default: 20000, unit: '秒', scale: 1000, group: '唤醒', label: '接续窗口',
@@ -324,15 +328,14 @@ async function handlePoke(bot, ev, notice) {
     bot.log.debug(`[戳一戳] ${POKE_COOLDOWN_MS}ms 内已回过, 跳过 user=${poker}`)
     return
   }
+  // 回戳是顺带的动作；**真正让人看到的是那句话**（只回戳的话对方只觉得没反应）
+  let poked = false
   try {
-    if (typeof bot.napcat?.poke === 'function' && await bot.napcat.poke(ev.chatKey, poker)) {
-      bot.log.info(`[戳一戳] ${ev.chatKey} user=${poker} 戳了本机 → 回戳`)
-      return
-    }
+    if (typeof bot.napcat?.poke === 'function' && await bot.napcat.poke(ev.chatKey, poker)) poked = true
   } catch (e) {
-    bot.log.warn(`回戳失败 (${ev.chatKey}): ${e.message} → 改用一句话回应`)
+    bot.log.warn(`回戳失败 (${ev.chatKey}): ${e.message}`)
   }
-  bot.log.info(`[戳一戳] ${ev.chatKey} user=${poker} 戳了本机 → 回一句`)
+  bot.log.info(`[戳一戳] ${ev.chatKey} user=${poker} 戳了本机 → ${poked ? '回戳 + ' : ''}回一句`)
   await bot.deliver(ev.chatKey, pickLine(bot, 'poke', DEFAULT_POKE))
 }
 
@@ -341,7 +344,11 @@ async function handlePoke(bot, ev, notice) {
  * ⚠️ 同一条只试一次：以前批量撤回时对同一条反复重试, 每条都超时, 把群刷爆了。
  */
 async function tryRecall(bot, ev) {
-  if (!ev.replyToId || !/撤回|撤掉|撤销|回收|删除这条|把它撤了|撤了这/i.test(String(ev.text || ''))) return false
+  if (!ev.replyToId) return false
+  // 只认「整条消息就是一句撤回指令」——「聊到撤回」这类闲聊里出现关键词绝不能当命令
+  const bare = String(ev.text || '').trim().replace(/[\s\p{P}\p{S}]/gu, '')
+  if (!bare || bare.length > 8) return false
+  if (!/^(?:把)?(?:这(?:条|个)?|它)?(?:撤回|撤掉|撤销|回收|撤了)(?:吧|啊|呀|下|一下)?$/.test(bare)) return false
   const scratch = scratchOf(bot, ev.chatKey)
   const tried = (scratch.recallTried ||= new Set())
   const key = String(ev.replyToId)
@@ -360,10 +367,12 @@ async function tryRecall(bot, ev) {
       bot.log.info(`已撤回消息 (${ev.chatKey}, rid=${ev.replyToId})`)
       await bot.deliver(ev.chatKey, '✅ 已撤回那条消息~')
     } else {
-      await bot.deliver(ev.chatKey, `🙅 ${res?.msg || '无法撤回（可能非本机可撤消息/无权限/超过时限）'}\u3000剩下还超时内的可以继续引用着撤～`)
+      bot.log.warn(`撤回失败 (${ev.chatKey}, rid=${ev.replyToId}): ${res?.msg || 'unknown'}`)
+      await bot.deliver(ev.chatKey, '撤不动了，可能超过时间了')
     }
   } catch (e) {
-    await bot.deliver(ev.chatKey, `🙅 无法撤回: ${e.message}\u3000剩下还超时内的可以继续引用着撤～`)
+    bot.log.warn(`撤回异常 (${ev.chatKey}, rid=${ev.replyToId}): ${e.message}`)
+    await bot.deliver(ev.chatKey, '撤不掉了')
   }
   ev.stopped = true
   ev.stopReason = 'gate-wake:recall'
@@ -477,6 +486,12 @@ export default {
       // 私聊永远算被叫
       if (!ev.isGroup) {
         ev.wake = { kind: 'private' }
+        return
+      }
+
+      // ⓪ 必回群（控制台可配）：整群当对话态，任何消息都回
+      if (toNumList(effective(bot, 'alwaysReplyGroups')).includes(Number(ev.groupId))) {
+        ev.wake = { kind: 'always' }
         return
       }
 
