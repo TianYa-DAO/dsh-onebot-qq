@@ -482,6 +482,10 @@ test('群记忆：首轮给指针不贴正文；文件未变 0 字符；更新�
   assert.ok(h.ctx._prompts[2].content[0].text.includes('[本群记忆已更新'), '文件变化后给"已更新"提示')
 
   const tool = h.ctx._registeredTools.get('mcp__qq__read_memory')
+  // read_memory 现在 fail-closed（认不出本轮就拒）→ 登记一个"正在本群回话"的 activeTurn，
+  // 这样内核的 resolveCurrentTurn 才认得出来（它按 target 查 activeTurns）
+  h.kernel.activeTurns.set(`group:${GROUP_ID}`, { chatKey: `group:${GROUP_ID}` })
+  t.after(() => h.kernel.activeTurns.delete(`group:${GROUP_ID}`))
   const res = await tool.execute({ target: `group:${GROUP_ID}` })
   const text = typeof res === 'string' ? res : JSON.stringify(res)
   assert.ok(text.includes('爱聊'), 'read_memory 返回正文')

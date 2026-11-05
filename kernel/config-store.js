@@ -58,6 +58,10 @@ export function defaultConfig() {
       longForwardChunkSize: 800,
       quoteAfterMsgs: 3,
       groupContextCount: 10,
+      groupContextImages: 12,          // 上文最多带几张图（安全阀，防请求过大）
+      groupContextStickers: true,      // 上文里的表情包也当图带上（false = 只带真图）
+      groupContextImageMaxAgeMin: 30,  // 只带上文里这么多分钟内的图（与群上文 30 分钟窗口一致）
+      imagePartsMax: 12,               // 单轮进模型的总图上限（当前消息 + 上文）
     },
     archive: { enabled: true, dir: 'logs/qq_chat' },
     toolPrefix: 'mcp__qq__',

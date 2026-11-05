@@ -28,6 +28,10 @@ export default {
   order: 90,
 
   configSchema: {
+    skipGroups: {
+      type: 'group', default: [], group: '群记忆', label: '不积累记忆的群',
+      hint: '勾上的群不留记忆、也不注入（比如闲聊灌水群）。别的群不受影响。',
+    },
     enabled: { type: 'bool', default: true, group: '群记忆', label: '群记忆（指针注入）', hint: '开：把本群历史要点作为提示注入上下文，帮它记住群里的事；关：不读记忆。' },
     dir: {
       type: 'str', default: 'qq-memory', group: '群记忆', label: '记忆目录',
@@ -222,7 +226,10 @@ export default {
         const gid = m[1]
         // 只读本群：拿本轮会话当边界。别的群号不可能是本轮 → 拒绝，别让这条路变成读别的群
         const turn = bot.currentTurn()
-        if (turn && turn.chatKey && turn.chatKey !== target) {
+        // fail-closed：认不出本轮会话就拒绝（超长回合 currentTurn 可能是 null，
+        // 旧写法 turn 为 null 时直接放行 → 模型传别的群号就能读任意群的记忆）
+        if (!turn || !turn.chatKey) throw new Error('读不到本轮会话，暂时不能读群记忆（请在本群回话时再读）')
+        if (turn.chatKey !== target) {
           throw new Error(`只能读本群记忆（本轮会话是 ${turn.chatKey}，不是 ${target}）`)
         }
         const mem = readMemory(gid)

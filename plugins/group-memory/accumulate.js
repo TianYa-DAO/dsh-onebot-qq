@@ -125,18 +125,25 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
   }
 
   /** 群号清单：聊天留档里出现过的群 ∪ 已有记忆文件的群。 */
+  /** 该群是否被排除（她在群设置里勾了"不积累记忆"）。
+   *  cfg 是传入的配置对象引用（内核热改是就地改这个对象），所以直接读字段，不要当函数调。 */
+  function skippedGroup(gid) {
+    const list = Array.isArray(cfg?.skipGroups) ? cfg.skipGroups.map(String) : []
+    return list.includes(String(gid))
+  }
+
   function listGroupIds() {
     const ids = new Set()
     let names = []
     try { names = fs.readdirSync(archiveDirOf()) } catch { names = [] }
     for (const n of names) {
       const m = /^group_(\d{4,12})\.jsonl(?:\.\d+)?$/.exec(n)
-      if (m) ids.add(m[1])
+      if (m && !skippedGroup(m[1])) ids.add(m[1])
     }
     try {
       for (const n of fs.readdirSync(memoryDirOf())) {
         const m = /^(\d{4,12})\.md$/.exec(n)
-        if (m) ids.add(m[1])
+        if (m && !skippedGroup(m[1])) ids.add(m[1])
       }
     } catch { /* 目录还没建 */ }
     return [...ids].sort()

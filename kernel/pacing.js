@@ -32,6 +32,16 @@ export const REPLY_DEFAULTS = {
   coldSilenceMs: 180000,     // 群安静多久算冷场（3 分钟）
   silenceEnabled: true,      // 冷场找话：关 = 只在群里有新消息时才可能接话（不定时找话）
   topicWindowMs: 600000,     // 机会窗口：到点后再等多久的合适时机（10 分钟）
+  repeatEnabled: true,       // 复读机：群里在刷同一句话时，跟着刷一句一模一样的
+  repeatMin: 3,              // 连着几个人说同一句，才跟着复读
+  repeatWindowMin: 3,        // 这些重复要发生在多少分钟内
+  repeatCooldownMin: 10,     // 复读冷却（同一个群）
+  // 按群覆盖上面这些参数：{ "群号": { hourlyMax, minGapMs, sensitivity, repeatEnabled, repeatMin, ... } }
+  // 没写的字段沿用全局值
+  groupOverrides: {},
+  // 按时间段覆盖（例如白天少、晚上多）：[{ from:'09:00', to:'18:00', hourlyMax:1, sensitivity:0.8 }, ...]
+  // 跨零点写法：from '22:00' to '02:00'。优先级：群覆盖 > 时间段 > 全局
+  timeProfiles: [],
   topicMinMsgs: 3,           // 窗口内至少几条消息才按"话题"挑时机（防单条消息就接）
   sensitivity: 0.45,         // 语境敏感度 0~1（越高越挑"值得接"的时机）
   maxChars: 140,             // 主动接话单条字数上限（提示用；超了照发但记日志）
@@ -88,6 +98,88 @@ export function thresholdForSensitivity(sensitivity) {
   return Math.max(0, Math.min(0.95, 0.15 + 0.7 * clamp01(sensitivity)))
 }
 
+/** 时间段里允许覆盖的字段（= 主动接话的所有节奏参数） */
+export const TIME_PROFILE_FIELDS = [
+  'hourlyMax', 'minGapMs', 'topicWindowMs', 'topicMinMsgs', 'sensitivity',
+  'coldSilenceMs', 'silenceEnabled', 'repeatEnabled', 'repeatMin',
+  'repeatWindowMin', 'repeatCooldownMin', 'maxChars',
+]
+
+/** 'H:M' / 'HH:MM' / '9' → 一天里的分钟数；不合法返回 null */
+export function normalizeHm(v) {
+  if (v == null) return null
+  const m = /^\s*(\d{1,2})\s*[:：]?\s*(\d{1,2})?\s*$/.exec(String(v))
+  if (!m) return null
+  const h = Number(m[1])
+  const mi = Number(m[2] || 0)
+  if (!Number.isFinite(h) || !Number.isFinite(mi) || h > 24 || mi > 59) return null
+  if (h === 24 && mi > 0) return null
+  return (h % 24) * 60 + mi
+}
+
+/** 一天中的分钟数（本地时区） */
+export function minutesOfDay(date) {
+  const d = date instanceof Date ? date : new Date(Number(date) || Date.now())
+  return d.getHours() * 60 + d.getMinutes()
+}
+
+/** 把 Date / {dow,dom,month} 归一成 { dow:0-6(周日=0), dom:1-31, month:1-12 } */
+export function normalizeWhen(when) {
+  if (when instanceof Date) {
+    return { dow: when.getDay(), dom: when.getDate(), month: when.getMonth() + 1 }
+  }
+  const w = when && typeof when === 'object' ? when : {}
+  return {
+    dow: Number.isFinite(Number(w.dow)) ? Number(w.dow) : null,
+    dom: Number.isFinite(Number(w.dom)) ? Number(w.dom) : null,
+    month: Number.isFinite(Number(w.month)) ? Number(w.month) : null,
+  }
+}
+
+/**
+ * 挑出当前时刻命中的时间段（支持跨零点 + 星期/日期/月份过滤；先命中先用）。
+ * 条目里 `days`（0=周日…6=周六）、`dates`（每月几号）、`months`（1~12）都是可选过滤器，
+ * 不写就不限；写了必须命中。
+ * @param {Array<{from:number,to:number,days?:number[],dates?:number[],months?:number[]}>} profiles
+ * @param {number} min 当前分钟数
+ * @param {Date|{dow:number,dom:number,month:number}} [when] 日期上下文（不传则不筛星期/日期/月份）
+ * @returns {object} 命中的那段，没命中返回 {}
+ */
+export function pickTimeProfile(profiles, min, when = null) {
+  if (!Array.isArray(profiles) || !profiles.length) return {}
+  const now = Number(min)
+  if (!Number.isFinite(now)) return {}
+  const w = when == null ? null : normalizeWhen(when)
+  for (const p of profiles) {
+    if (w) {
+      if (Array.isArray(p.days) && p.days.length && w.dow != null && !p.days.includes(w.dow)) continue
+      if (Array.isArray(p.dates) && p.dates.length && w.dom != null && !p.dates.includes(w.dom)) continue
+      if (Array.isArray(p.months) && p.months.length && w.month != null && !p.months.includes(w.month)) continue
+    }
+    const from = Number(p.from)
+    const to = Number(p.to)
+    if (!Number.isFinite(from) || !Number.isFinite(to)) continue
+    const hit = from === to ? true : (from < to ? (now >= from && now < to) : (now >= from || now < to))
+    if (hit) return p
+  }
+  return {}
+}
+
+/** 把 days/dates/months 这类过滤器归一成数字数组（去重、去非法值） */
+export function normalizeFilterList(v, lo, hi) {
+  if (v == null) return undefined
+  const arr = Array.isArray(v) ? v : String(v).split(/[,，\s]+/)
+  const out = []
+  for (const x of arr) {
+    const t = String(x).trim()
+    if (!t) continue
+    const n = Number(t)
+    if (!Number.isInteger(n) || n < lo || n > hi) continue
+    if (!out.includes(n)) out.push(n)
+  }
+  return out.length ? out : undefined
+}
+
 /** 把实例配置的 `pacing` 段归一成"每块都齐全"的配置（数组/对象两种群号写法都认） */
 function normalize(rawPacing) {
   const p = rawPacing && typeof rawPacing === 'object' ? rawPacing : {}
@@ -101,6 +193,58 @@ function normalize(rawPacing) {
     for (const [g, on] of Object.entries(r.groups)) if (on === true) groups[String(g)] = true
   }
   const m = p.merge && typeof p.merge === 'object' ? p.merge : {}
+  // 按群覆盖：只收对象；值保持原样（用的时候才做数字/布尔归一）
+  const groupOverrides = {}
+  if (r.groupOverrides && typeof r.groupOverrides === 'object' && !Array.isArray(r.groupOverrides)) {
+    for (const [gid, ov] of Object.entries(r.groupOverrides)) {
+      const g = String(gid || '').trim()
+      if (!/^\d{4,12}$/.test(g) || !ov || typeof ov !== 'object' || Array.isArray(ov)) continue
+      const copy = { ...ov }
+      if (Array.isArray(copy.timeProfiles)) {
+        const arr = []
+        for (const raw of copy.timeProfiles) {
+          if (!raw || typeof raw !== 'object') continue
+          const from = normalizeHm(raw.from)
+          const to = normalizeHm(raw.to)
+          if (from == null || to == null) continue
+          const entry = { from, to }
+          for (const k of TIME_PROFILE_FIELDS) if (raw[k] !== undefined) entry[k] = raw[k]
+          const days = normalizeFilterList(raw.days, 0, 6)
+          const dates = normalizeFilterList(raw.dates, 1, 31)
+          const months = normalizeFilterList(raw.months, 1, 12)
+          if (days) entry.days = days
+          if (dates) entry.dates = dates
+          if (months) entry.months = months
+          arr.push(entry)
+        }
+        copy.timeProfiles = arr
+      } else {
+        delete copy.timeProfiles
+      }
+      groupOverrides[g] = copy
+    }
+  }
+
+  // 时间段覆盖：{from:'HH:MM', to:'HH:MM', 任意 reply 字段}
+  const timeProfiles = []
+  if (Array.isArray(r.timeProfiles)) {
+    for (const raw of r.timeProfiles) {
+      if (!raw || typeof raw !== 'object') continue
+      const from = normalizeHm(raw.from)
+      const to = normalizeHm(raw.to)
+      if (from == null || to == null) continue
+      const entry = { from, to }
+      for (const k of TIME_PROFILE_FIELDS) if (raw[k] !== undefined) entry[k] = raw[k]
+      const days = normalizeFilterList(raw.days, 0, 6)
+      const dates = normalizeFilterList(raw.dates, 1, 31)
+      const months = normalizeFilterList(raw.months, 1, 12)
+      if (days) entry.days = days
+      if (dates) entry.dates = dates
+      if (months) entry.months = months
+      timeProfiles.push(entry)
+    }
+  }
+
   return {
     reply: {
       ...REPLY_DEFAULTS,
@@ -108,6 +252,8 @@ function normalize(rawPacing) {
       style: { ...REPLY_DEFAULTS.style, ...style },
       weights: { ...REPLY_DEFAULTS.weights, ...weights },
       groups,
+      groupOverrides,
+      timeProfiles,
     },
     merge: { ...MERGE_DEFAULTS, ...m },
   }
@@ -127,6 +273,7 @@ export function createPacing({ log = console, state, clock = null }) {
   let lastLogged = ''
   let timer = null
   let onProactiveTurn = null
+  let onRepeat = null
   let isBusy = () => false
 
   // ── 合批 ────────────────────────────────────────────────────
@@ -138,6 +285,7 @@ export function createPacing({ log = console, state, clock = null }) {
   const rings = new Map()    // chatKey → [{ ts, text, mentionBot, atOther, hasQuestion, placeholderOnly, short }]
   const opp = new Map()      // chatKey → { dueAt, windowUntil, fired, missed }
   const fired = []           // 最近主动接话事件 [{ at, chatKey, gid, reason, score, sent }]
+  const lastRepeat = new Map() // chatKey → ts（复读冷却）
   const MAX_RING = 60
   const RING_TTL = 30 * 60000
 
@@ -151,6 +299,50 @@ export function createPacing({ log = console, state, clock = null }) {
   /** 当前生效的群集合（Set<群号字符串>） */
   function allowedGroups() {
     return new Set(Object.keys(cfg.reply.groups || {}))
+  }
+
+  // ── 按群覆盖：某个群的生效配置 = 全局值 + 该群 groupOverrides ──────────
+  const gidOfKey = (chatKey) => String(chatKey || '').replace(/^group:/, '')
+  /** 当前命中的时间段（群的优先，没有就用全局的） */
+  function currentProfile(chatKey = '') {
+    const at = new Date(nowMs())
+    const now = minutesOfDay(at)
+    const ov = (cfg.reply.groupOverrides || {})[gidOfKey(chatKey)]
+    if (ov && Array.isArray(ov.timeProfiles) && ov.timeProfiles.length) {
+      const gp = pickTimeProfile(ov.timeProfiles, now, at)
+      if (gp && Object.keys(gp).length) return gp
+    }
+    return pickTimeProfile(cfg.reply.timeProfiles || [], now, at)
+  }
+
+  /**
+   * 四层取值（从最具体到最笼统）：
+   *   ① 该群自己的时段表  ② 该群的固定覆盖  ③ 全局时段表  ④ 全局值
+   */
+  function layered(chatKey, field) {
+    const at = new Date(nowMs())
+    const now = minutesOfDay(at)
+    const ov = (cfg.reply.groupOverrides || {})[gidOfKey(chatKey)]
+    if (ov) {
+      if (Array.isArray(ov.timeProfiles) && ov.timeProfiles.length) {
+        const gp = pickTimeProfile(ov.timeProfiles, now, at)
+        if (gp && gp[field] !== undefined) return gp[field]
+      }
+      if (ov[field] !== undefined) return ov[field]
+    }
+    const prof = pickTimeProfile(cfg.reply.timeProfiles || [], now, at)
+    if (prof && prof[field] !== undefined) return prof[field]
+    return cfg.reply[field]
+  }
+
+  /** 取某群生效的 reply 字段值（数字） */
+  function rnum(chatKey, field, dflt) {
+    return num(layered(chatKey, field), dflt)
+  }
+  /** 取某群生效的布尔字段（未设置时用 dflt） */
+  function rbool(chatKey, field, dflt = true) {
+    const v = layered(chatKey, field)
+    return v === undefined ? dflt : v !== false
   }
 
   /** 写一条进"最近群消息环"（只收允许主动接话的群；自检也用它造样本） */
@@ -204,20 +396,20 @@ export function createPacing({ log = console, state, clock = null }) {
     }
   }
 
-  function hourIntervalMs() {
-    const n = Math.max(0, num(cfg.reply.hourlyMax, 0))
+  function hourIntervalMs(chatKey = '') {
+    const n = Math.max(0, rnum(chatKey, 'hourlyMax', 0))
     return n > 0 ? HOUR / n : Infinity
   }
 
-  function opportunityGapMs() {
-    return Math.max(num(cfg.reply.minGapMs, 900000), hourIntervalMs())
+  function opportunityGapMs(chatKey = '') {
+    return Math.max(rnum(chatKey, 'minGapMs', 900000), hourIntervalMs(chatKey))
   }
 
   /** 某群的"下一次机会"状态（懒创建；开机后第一次随机错开，避免重启瞬间一起开口） */
   function oppOf(chatKey) {
     let o = opp.get(chatKey)
     if (!o) {
-      const gap = opportunityGapMs()
+      const gap = opportunityGapMs(chatKey)
       const wait = Number.isFinite(gap) ? gap * (0.4 + Math.random() * 0.6) : Infinity
       o = { dueAt: Number.isFinite(wait) ? nowMs() + wait : Infinity, windowUntil: 0, fired: 0, missed: 0 }
       opp.set(chatKey, o)
@@ -250,12 +442,12 @@ export function createPacing({ log = console, state, clock = null }) {
   function ensureWindow(chatKey, now) {
     const o = oppOf(chatKey)
     if (now < o.dueAt) return null
-    if (!o.windowUntil) o.windowUntil = now + Math.max(60000, num(cfg.reply.topicWindowMs, 600000))
+    if (!o.windowUntil) o.windowUntil = now + Math.max(60000, rnum(chatKey, 'topicWindowMs', 600000))
     if (now > o.windowUntil) {
       o.windowUntil = 0
-      o.dueAt = now + opportunityGapMs()
+      o.dueAt = now + opportunityGapMs(chatKey)
       o.missed += 1
-      log.info(`[主动接话] ${chatKey} 本次没有合适时机，放弃（下次约 ${Math.round(opportunityGapMs() / 60000)} 分钟后）`)
+      log.info(`[主动接话] ${chatKey} 本次没有合适时机，放弃（下次约 ${Math.round(opportunityGapMs(chatKey) / 60000)} 分钟后）`)
       return null
     }
     return o
@@ -266,7 +458,7 @@ export function createPacing({ log = console, state, clock = null }) {
     const o = oppOf(chatKey)
     const now = nowMs()
     o.windowUntil = 0
-    o.dueAt = now + opportunityGapMs()
+    o.dueAt = now + opportunityGapMs(chatKey)
     o.fired += 1
     fired.push({ at: now, chatKey, gid, reason, score: Number(score) || 0, sent: false })
     while (fired.length > 30) fired.shift()
@@ -277,36 +469,91 @@ export function createPacing({ log = console, state, clock = null }) {
       .catch((e) => log.error(`[主动接话] 起回合失败 ${chatKey}: ${e.stack || e.message}`))
   }
 
+  /** 归一化一句话用于比对：去空白/全角空格/常见标点尾巴。 */
+  function normRepeat(t) {
+    return String(t || '')
+      .replace(/[\s\u3000]+/g, '')
+      .replace(/[。！？!?…~〜]+$/g, '')
+      .toLowerCase()
+  }
+
+  /**
+   * 复读机：最近窗口里有多少条消息跟这句一模一样（含刚进来的这条）。
+   * 命中且不在冷却里 → 调 onRepeat 让内核原样发出去，返回 true（这轮不再走模型）。
+   */
+  function tryRepeat(chatKey, gid, text, now) {
+    if (!rbool(chatKey, 'repeatEnabled', true)) return false
+    const want = normRepeat(text)
+    if (want.length < 4) return false                    // 太短不玩（「？」「好」）
+    if (/^\[(表情|图片|视频|语音|文件)/.test(String(text || ''))) return false
+
+    const windowMs = Math.max(30000, rnum(chatKey, 'repeatWindowMin', 3) * 60000)
+    const list = (rings.get(chatKey) || []).filter((m) => now - m.ts < windowMs)
+    // 当前这条已经在 rings 里了（noteInbound 先于 consider），所以直接数
+    const same = list.filter((m) => !m.placeholderOnly && !m.short && normRepeat(m.text) === want)
+    const count = same.length
+    const need = Math.max(2, rnum(chatKey, 'repeatMin', 3))
+    if (count < need) return false
+
+    const cdMs = Math.max(60000, rnum(chatKey, 'repeatCooldownMin', 10) * 60000)
+    const last = Number(lastRepeat.get(chatKey) || 0)
+    if (now - last < cdMs) return false
+    if (typeof onRepeat !== 'function') return false
+
+    lastRepeat.set(chatKey, now)
+    fired.push({ at: now, chatKey, gid, reason: 'repeat', score: 1, sent: true })
+    while (fired.length > 30) fired.shift()
+    const o = oppOf(chatKey)
+    o.dueAt = now + opportunityGapMs()
+    log.info(`[复读机] ${chatKey} 连着 ${count} 人刷同一句 → 跟着复读`)
+    Promise.resolve()
+      .then(() => onRepeat({ chatKey, groupId: gid, text: String(text || '').trim(), count }))
+      .catch((e) => log.error(`[复读机] 失败 ${chatKey}: ${e.message}`))
+    return true
+  }
+
   /**
    * 一条**没唤醒机器人**的群消息进来后：看看要不要把它捡成"接话时机"。
    * 内核在管线跑完后调（有 wake 的消息不进来，避免被叫时同时主动插话）。
    */
   function consider(ev) {
-    if (!cfg.reply.enabled || num(cfg.reply.hourlyMax, 0) <= 0) return
+    if (!cfg.reply.enabled) return
     if (!ev?.isGroup) return
     const key = String(ev.chatKey ?? '')
     if (!key) return
     const gid = String(ev.groupId ?? key.replace(/^group:/, ''))
     if (!allowedGroups().has(gid)) return
+    // 这个群单独关掉了主动接话（群对话框里的「主动接话：关」）
+    if (layered(key, 'enabled') === false) return
+    // 按群覆盖 hourlyMax=0 也等于关
+    if (rnum(key, 'hourlyMax', 0) <= 0) return
+
+    // ── ⓪ 复读机：群里连着几个人刷同一句话 → 跟着刷一句一模一样的（不走模型，省 token）──
+    //    放在「机会间隔/窗口」之前：复读不参与主动接话的 8 分钟节奏
+    const repeatNow = Number(ev?.time) > 0 ? Number(ev.time) : nowMs()
+    if (tryRepeat(key, gid, String(ev.text || '').trim(), repeatNow)) return
+
     if (isBusy(key)) return // 这个群正在被叫的一轮里，不抢
     const now = nowMs()
     const o = ensureWindow(key, now)
     if (!o) return
     const text = String(ev.text || '').trim()
+
     // 窗口里至少得有几条消息才按"话题"挑时机：单条孤零零的消息不接（冷场路径另算）
-    const recent = (rings.get(key) || []).filter((m) => now - m.ts < Math.max(60000, num(cfg.reply.topicWindowMs, 600000) / 2))
-    if (recent.length < Math.max(1, num(cfg.reply.topicMinMsgs, 3))) return
+    const recent = (rings.get(key) || []).filter((m) => now - m.ts < Math.max(60000, rnum(key, 'topicWindowMs', 600000) / 2))
+    if (recent.length < Math.max(1, rnum(key, 'topicMinMsgs', 3))) return
     const last = recent[recent.length - 1]
     // 纯表情/图/太短的：不按话题接（分值也会很低，这里先挡一道省计算）
     if (!text || last?.placeholderOnly || last?.short) return
     const { score, logit } = interestFor(ev)
-    const threshold = thresholdForSensitivity(cfg.reply.sensitivity)
+    const threshold = thresholdForSensitivity(rnum(key, 'sensitivity', 0.45))
     log.debug(`[主动接话] ${key} 兴趣分 ${(score * 100).toFixed(0)}% / 门槛 ${(threshold * 100).toFixed(0)}%（logit ${logit.toFixed(2)}）`)
     if (score >= threshold) fire(key, gid, 'topic', score)
   }
 
   /** 冷场找话是否开启（关 = 只由入站消息驱动「话题合适时接话」，不再定时找话）。 */
   const silenceOn = () => cfg.reply.silenceEnabled !== false
+  const silenceOnFor = (chatKey) => rbool(chatKey, 'silenceEnabled', true)
 
   /** 冷场：到点了、群又安静够久 → 直接起一轮"找话"（不等消息） */
   function tick() {
@@ -315,9 +562,12 @@ export function createPacing({ log = console, state, clock = null }) {
     const now = nowMs()
     for (const gid of allowedGroups()) {
       const key = `group:${gid}`
+      if (layered(key, 'enabled') === false) continue
+      if (!silenceOnFor(key)) continue
+      if (rnum(key, 'hourlyMax', 0) <= 0) continue
       const st = state.get(key)
       const silence = now - Number(st.lastInboundAt || 0)
-      if (silence < num(cfg.reply.coldSilenceMs, 300000)) continue
+      if (silence < rnum(key, 'coldSilenceMs', 300000)) continue
       if (isBusy(key)) continue
       const o = ensureWindow(key, now)
       if (!o) continue
@@ -332,6 +582,7 @@ export function createPacing({ log = console, state, clock = null }) {
    */
   function start(opts = {}) {
     if (typeof opts.onProactiveTurn === 'function') onProactiveTurn = opts.onProactiveTurn
+    if (typeof opts.onRepeat === 'function') onRepeat = opts.onRepeat
     if (typeof opts.isBusy === 'function') isBusy = opts.isBusy
     if (timer) clearInterval(timer)
     timer = null

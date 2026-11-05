@@ -26,6 +26,12 @@
  *   · 审批等待期的「允许/拒绝」→ 交给内核挂的回调（本插件不持有审批状态）。
  */
 
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { applyOverrides, overridesFor, validateWord, isTooGeneric, changesToday, pushHistory,
+         wakeGroupsPath, readAll, writeAll, mutateAtomic,
+         MAX_ADD, MAX_REMOVE, MAX_CHANGES_PER_DAY } from '../../platform/wake-groups.js'
+
 /** 纯呼名判定用的语气词（「名字呀」/「名字～」这种不算正文） */
 const NAME_ONLY_FILLERS = /[呀啊欸诶嘛啦哦喔咯嗯哎哟呜呦]/g
 /** 没有 callAck 句池时的兜底（句池由 persona-voice 挂在 bot.linesPool 上） */
@@ -243,10 +249,20 @@ async function isQuotingSelf(bot, ev) {
  */
 function wakeWordsOf(bot, gid) {
   const norm = (list) => list.map((x) => String(x ?? '').trim().toLowerCase()).filter(Boolean)
+  // 她的偏好层最后套（加词/删词）：换人设、改配置都不会把她调的东西冲掉
+  const withHerPrefs = (list) => {
+    if (gid == null || gid === '') return norm(list)
+    try {
+      return norm(applyOverrides(list, overridesFor(dshHome(), gid)))
+    } catch (e) {
+      bot.log.warn(`套用唤醒词偏好失败: ${e.message}`)
+      return norm(list)
+    }
+  }
   try {
     const v = bot.readWakeWords?.(gid)
     const list = Array.isArray(v) ? v : Array.isArray(v?.words) ? v.words : []
-    if (list.length) return norm(list)
+    if (list.length) return withHerPrefs(list)
   } catch (e) {
     bot.log.warn(`读唤醒词失败: ${e.message}`)
   }
@@ -254,7 +270,14 @@ function wakeWordsOf(bot, gid) {
   if (!table || typeof table !== 'object') return []
   const global = Array.isArray(table['*']) ? table['*'] : []
   const extra = gid != null && gid !== '' && Array.isArray(table[String(gid)]) ? table[String(gid)] : []
-  return norm([...global, ...extra])
+  return withHerPrefs([...global, ...extra])
+}
+
+/** 数据目录（她调的唤醒词落在 DSH_HOME/dsh-onebot-qq/state） */
+function dshHome() {
+  const h = String(process.env.DSH_HOME || '').trim()
+  if (h) return h
+  try { return join(homedir(), '.dsh') } catch { return '' }
 }
 
 /** 命中哪个唤醒词（包含匹配、大小写不敏感）；没词表 = 不启用关键词唤醒（不自己造词，通用词会误触发） */
@@ -410,9 +433,12 @@ export default {
 
     // ── pre-gate：硬门禁（fail-closed 阶段；异常会被内核当"拦住"，所以只做纯判断） ──
     bot.on('pre-gate', (ev) => {
-      // 内核 normalizeEvent 已按 adminQq 填 sender.isMaster；本插件 adminQq 配了就以它为准
-      // （配置迁移时 admins 可能不止一个，靠这一手兜底）。
-      if (ev.sender && bot.cfg.adminQq) ev.sender.isMaster = String(ev.sender.qq) === String(bot.cfg.adminQq)
+      // 主人身份以**内核**为准（runtime.adminQq → bot.core.adminQq）。
+      // ⚠️ 这里只允许「补齐为 true」，绝不能把内核判定改小：
+      //    插件配置里那份 adminQq 可能滞后（主人 QQ 热改后还没同步），
+      //    一旦拿它覆盖，新主人会被静默降权（指令拒绝、私聊不再豁免脱敏、白名单把自己拦掉）。
+      const masterQq = Number(bot.core?.adminQq) || Number(bot.cfg?.adminQq) || 0
+      if (ev.sender && masterQq > 0 && String(ev.sender.qq) === String(masterQq)) ev.sender.isMaster = true
 
       // ⚠️ 下面的 effective() 每次判定都现读 `bot.cfg`（控制台热同步就地改这个对象 → 热改立即生效）
       const isMaster = ev.sender?.isMaster === true
@@ -563,6 +589,113 @@ export default {
       // 但内核会把它交给「主动接话」看看要不要捡成接话时机（见 kernel/pacing.js 的 consider）。
       bot.log.debug(`群 ${ev.groupId} 未唤醒, 忽略（没 @、没引用本机、没接续、没关键词）`)
       ev.stopReason = 'gate-wake:not-woken'
+    })
+
+    // ══════════════════════════════════════════════════════════
+    // 工具：她自己调本群唤醒词（按喜好加/删叫法）
+    // ══════════════════════════════════════════════════════════
+    /** 当前是哪个群的会话（工具只对本群生效，防止她改别的群） */
+    function currentGroupOf() {
+      const turn = bot.currentTurn?.()
+      const chatKey = String(turn?.chatKey || '')
+      const m = /^group:(\d{4,12})$/.exec(chatKey)
+      return m ? m[1] : ''
+    }
+
+    /** 读改写一条 group 覆盖记录 */
+    function mutateGroup(gid, fn) {
+      // 串行读改写：并发调工具也不会丢更新；rec 被手改坏（add:null）也能自愈
+      return mutateAtomic(wakeGroupsPath(dshHome()), (all) => {
+        const prev = all[String(gid)] || {}
+        const rec = {
+          add: Array.isArray(prev.add) ? prev.add : [],
+          remove: Array.isArray(prev.remove) ? prev.remove : [],
+          at: Number(prev.at) || 0,
+          history: Array.isArray(prev.history) ? prev.history : [],
+        }
+        const out = fn(rec)
+        all[String(gid)] = rec
+        return out
+      })
+    }
+
+    bot.registerTool('wake_words_list', {
+      description: '看本群现在有哪些词能把你叫起来（含人设默认词 + 你自己加/删的）。'
+        + '想知道这个群里大家怎么叫你会被听见时用。只读。',
+      parameters: {},
+      async execute() {
+        const turn = bot.currentTurn?.()
+        const gid = currentGroupOf()
+        if (!gid) return { ok: false, reason: '唤醒词只能按群查看（私聊不适用）' }
+        const words = wakeWordsOf(bot, gid)
+        const ov = overridesFor(dshHome(), gid)
+        return {
+          ok: true, group_id: gid, words,
+          added_by_me: ov.add, removed_by_me: ov.remove,
+          hint: '这些词只要消息里**包含**就会被唤醒（大小写不敏感）。',
+        }
+      },
+    })
+
+    bot.registerTool('wake_words_add', {
+      description: '把你喜欢的一个叫法加进**本群**的唤醒词（比如群里都叫你「阿梨」，你愿意被这么叫）。'
+        + '只对本群生效；别加太泛的词（「你」「在吗」这种会让群里随便一句话就叫醒你）。',
+      parameters: {
+        word: { type: 'string', required: true, description: '要加的叫法（1~8 个字，不要空格和标点）' },
+        why: { type: 'string', description: '可选：为什么加（记进变更历史）' },
+      },
+      async execute(args = {}) {
+        const gid = currentGroupOf()
+        if (!gid) throw new Error('唤醒词只能按群调整（私聊不适用）')
+        const word = String(args?.word || '').trim()
+        const cur = wakeWordsOf(bot, gid)
+        const bad = validateWord(word, cur)
+        if (bad) throw new Error(bad)
+        if (isTooGeneric(word)) throw new Error(`「${word}」太泛了，加了群里随便一句话都会叫醒你`)
+        const ov0 = overridesFor(dshHome(), gid)
+        if (ov0.add.length >= MAX_ADD) throw new Error(`本群自己加的词最多 ${MAX_ADD} 个，先删掉不喜欢的`)
+        if (changesToday(ov0) >= MAX_CHANGES_PER_DAY) throw new Error('今天这个群已经调过好几次了，明天再说')
+
+        mutateGroup(gid, (rec) => {
+          rec.add = [...new Set([...rec.add, word])]
+          rec.remove = rec.remove.filter((x) => String(x).toLowerCase() !== word.toLowerCase())
+          rec.at = Date.now()
+          rec.history = pushHistory(rec, { w: `+${word}`, why: String(args?.why || ''), at: Date.now() })
+        })
+        bot.log.info(`[唤醒词] 她加了「${word}」到群 ${gid}（${String(args?.why || '无理由')}）`)
+        return { ok: true, group_id: gid, added: word, words: wakeWordsOf(bot, gid) }
+      },
+    })
+
+    bot.registerTool('wake_words_remove', {
+      description: '把本群里一个你**不喜欢**的叫法从唤醒词里去掉（比如被叫了不喜欢的绰号，以后这么叫就不理）。'
+        + '只对本群生效；人设默认词也能去（会记进「删掉的词」）。',
+      parameters: {
+        word: { type: 'string', required: true, description: '要去掉的叫法' },
+        why: { type: 'string', description: '可选：为什么去掉' },
+      },
+      async execute(args = {}) {
+        const gid = currentGroupOf()
+        if (!gid) throw new Error('唤醒词只能按群调整（私聊不适用）')
+        const word = String(args?.word || '').trim()
+        if (!word) throw new Error('要去掉哪个词？')
+        const cur = wakeWordsOf(bot, gid)
+        if (!cur.some((x) => x === word.toLowerCase())) throw new Error(`本群本来就没有「${word}」这个唤醒词`)
+        if (cur.length <= 1) throw new Error('只剩这一个词了，去掉她在这个群就叫不起来了')
+
+        const ov0 = overridesFor(dshHome(), gid)
+        if (ov0.remove.length >= MAX_REMOVE) throw new Error('删掉的词太多了，先去面板清一下')
+        if (changesToday(ov0) >= MAX_CHANGES_PER_DAY) throw new Error('今天这个群已经调过好几次了，明天再说')
+
+        mutateGroup(gid, (rec) => {
+          rec.remove = [...new Set([...rec.remove, word])]
+          rec.add = rec.add.filter((x) => String(x).toLowerCase() !== word.toLowerCase())
+          rec.at = Date.now()
+          rec.history = pushHistory(rec, { w: `-${word}`, why: String(args?.why || ''), at: Date.now() })
+        })
+        bot.log.info(`[唤醒词] 她去掉了群 ${gid} 的「${word}」（${String(args?.why || '无理由')}）`)
+        return { ok: true, group_id: gid, removed: word, words: wakeWordsOf(bot, gid) }
+      },
     })
   },
 }

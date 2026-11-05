@@ -32,11 +32,16 @@ function makeBot({ dataDir, archiveDir, cfg = {}, runner }) {
     dsh: runner ? { runIsolatedTask: runner } : {},
     on() {},
     registerTool(name, def) { tools.set(name, def) },
-    currentTurn: () => null,
+    // read_memory 已改 fail-closed（认不出本轮就拒）；测试用这个变量指定"本轮群"，
+    // 默认 null = 认不出（想测拒绝路径的用例可以留着 null）
+    currentTurn: () => (CURRENT_GROUP ? { chatKey: `group:${CURRENT_GROUP}` } : null),
     onDispose() {},
   }
   return { bot, shared, tools }
 }
+
+/** 测试用：当前"本轮会话"的群号（null = 认不出） */
+let CURRENT_GROUP = null
 
 function tmp() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'qqbot-gmfix-'))
@@ -86,6 +91,7 @@ test('群记忆修复：>maxBytes 的记忆合并后不丢尾、截断提示不�
   plugin.setup(bot)
 
   // 返回给模型的仍按 maxBytes 截断，并明确告诉它被截断了（在合并把文件缩到上限内之前测）
+  CURRENT_GROUP = GROUP
   const tool = tools.get('read_memory')
   const before = await tool.execute({ target: `group:${GROUP}` })
   assert.equal(before.clipped, true)

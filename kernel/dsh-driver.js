@@ -389,6 +389,7 @@ export function createDshDriver(opts) {
       const now = Date.now()
       const selfId = napcat.selfId
       const lines = []
+      const images = []   // ⚠️ extractText 其实给了 images，早先直接丢掉了 → 上文只剩「[图片]」
       for (const m of list.slice(start)) {
         const mid = String(m.message_id)
         if (mid === String(ev.messageId)) continue                        // 本条正文已在 prompt 里
@@ -398,15 +399,27 @@ export function createDshDriver(opts) {
         // 行格式与"当前消息"的前缀统一成 `[昵称(QQ:号)]: 内容`：不带号时同名/近名的人会串。
         // extractText 吃三种入参（段数组 / CQ 串 / 带 message 的对象）—— 历史条目两种形态都有。
         const raw = m.message ?? m.raw_message
-        const txt = clipChars(extractText(raw, selfId).text, 120).trim()
+        const parsed = extractText(raw, selfId)
+        const txt = clipChars(parsed.text, 120).trim()
         if (txt) lines.push(`[${who}(QQ:${uid})]: ${txt}`)
+        // 收集这一条里的图片。**表情包也收**（她说"没收到表情包具体图片"就是这个）：
+        // 表情包是群里的主要表达方式，只给「[表情]」文字她读不出情绪。
+        // 用 isSticker 标出来，交给上层决定优先顺序（真图优先占用额度）。
+        for (const im of parsed.images || []) {
+          if (!im?.url && !im?.file) continue
+          images.push({ url: im.url || '', file: im.file || '', who, uid,
+                        time: Number(m.time) * 1000, isSticker: !!im.isSticker })
+        }
       }
       // 水位推进到"本轮看到的最新一条"，而不是只记注入成功的：空文本/超龄消息下一轮不该重扫。
       if (state) state.lastContextId = list[list.length - 1]?.message_id ?? state.lastContextId
-      return lines.length ? `\n[群聊上文]\n${lines.slice(-count).join('\n')}` : ''
+      return {
+        block: lines.length ? `\n[群聊上文]\n${lines.slice(-count).join('\n')}` : '',
+        images,
+      }
     } catch (e) {
       log.debug(`取群聊上文失败 (${ev.groupId}): ${e.message}`)
-      return ''
+      return { block: '', images: [] }
     }
   }
 

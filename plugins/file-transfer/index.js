@@ -29,6 +29,45 @@ const FILE_TIMEOUT_MS = 60000
  * 发图与图生图都是"把本地文件交给外部"（发 QQ / 发第三方中转），所以白名单必须有，
  * 且必须先 realpath 再比对 —— 否则一个指向系统目录的软链就能把配置/凭据发出去。
  */
+/** 常见图片扩展名（与下面魔数校验双重把关） */
+const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'])
+const IMAGE_MAX_BYTES = 12 * 1024 * 1024
+
+/**
+ * 读文件头判真伪：返回 true 表示确实是图片。
+ * ⚠️ 只白名单目录是不够的 —— 数据目录里就躺着 config.json / users.json / 凭据文件，
+ *    万一路径被诱导传进来，QQ 那边会把整份文件当附件发出去。
+ *    这里按「魔数 + 扩展名」双判，非图片一律不发。
+ */
+function looksLikeImage(real) {
+  const ext = path.extname(real).toLowerCase()
+  if (!IMAGE_EXTS.has(ext)) return false
+  const st = fs.statSync(real)
+  if (!st.isFile() || st.size <= 0 || st.size > IMAGE_MAX_BYTES) return false
+  const fd = fs.openSync(real, 'r')
+  let head
+  try {
+    const buf = Buffer.alloc(12)
+    const n = fs.readSync(fd, buf, 0, 12, 0)
+    head = buf.subarray(0, n)
+  } finally {
+    fs.closeSync(fd)
+  }
+  if (head.length < 4) return false
+  // PNG: 89 50 4E 47
+  if (head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47) return true
+  // JPEG: FF D8 FF
+  if (head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) return true
+  // GIF: 47 49 46 38
+  if (head[0] === 0x47 && head[1] === 0x49 && head[2] === 0x46 && head[3] === 0x38) return true
+  // WebP: RIFF....WEBP
+  if (head.length >= 12 && head.toString('latin1', 0, 4) === 'RIFF'
+      && head.toString('latin1', 8, 12) === 'WEBP') return true
+  // BMP: 42 4D
+  if (head[0] === 0x42 && head[1] === 0x4d) return true
+  return false
+}
+
 function resolveAllowedImage(file, roots) {
   if (!file || !fs.existsSync(file)) throw new Error(`图片文件不存在: ${file}`)
   const real = fs.realpathSync(file)
@@ -36,6 +75,9 @@ function resolveAllowedImage(file, roots) {
     throw new Error(`图片路径必须在白名单目录下（当前白名单：${roots.join(' / ')}）: ${file}`)
   }
   if (!fs.statSync(real).isFile()) throw new Error(`不是文件: ${file}`)
+  if (!looksLikeImage(real)) {
+    throw new Error(`这不是图片文件，不能发（只允许 jpg/png/gif/webp/bmp，且≤12MB）: ${path.basename(real)}`)
+  }
   return real
 }
 

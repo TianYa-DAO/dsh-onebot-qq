@@ -111,6 +111,12 @@ export default {
       const n = Number(v)
       return Number.isFinite(n) && n >= 0 ? Math.round(n * 1000) : d
     }
+    /** "分钟"→毫秒；配置缺省/非法时用 d（分钟数）。cooldownMs 用的就是这个。 */
+    const msOfMinutes = (v, d) => {
+      const n = Number(v)
+      const min = Number.isFinite(n) && n >= 0 ? n : d
+      return Math.round(min * 60000)
+    }
 
     // ── 跨轮状态：ChatState._scratch（按 chatKey 天然隔离） ───────────────
     function scratchOf(chatKey) {
@@ -315,7 +321,8 @@ export default {
 
       const scratch = scratchOf(ev.chatKey)
       // 冷却：同群同人；先占位，固定模式发送失败会清掉（别让失败也吃冷却）
-      if (inCooldown(scratch, qq, msOfSec(cfg.cooldownMs, 600000))) {
+      // ⚠️ cooldownMs 的 schema 单位是**分钟**（scale 60000），不能用 msOfSec（那是秒×1000）
+      if (inCooldown(scratch, qq, msOfMinutes(cfg.cooldownMs, 10))) {
         log.debug(`[入群欢迎] 冷却中，跳过 ${ev.chatKey} ← ${qq}`)
         return
       }

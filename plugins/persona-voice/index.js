@@ -19,10 +19,12 @@
  * 内核解析成 `bot.core.keywordTable` 注入；本插件只负责"人设词表优先、群号词叠加"的取值链。
  */
 import { readFileSync, statSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { pickSplitPoint } from '../../kernel/format.js'
 import { stripBom } from '../../platform/atomic.js'
 import { activePersona as resolveActivePersona, personaSources } from '../../platform/persona-ref.js'
+import { applyOverrides, overridesFor } from '../../platform/wake-groups.js'
 
 /** 人设库目录缺省值（相对 dataDir，由内核解析成绝对路径） */
 const DEFAULT_PERSONA_DIR = 'personas'
@@ -253,8 +255,16 @@ export default {
       const global = Array.isArray(table['*']) ? table['*'] : []
       const extra = gid != null && gid !== '' ? (table[String(gid)] || []) : []
       // 人设词 + 配置全局词 + 群专属词：合并去重（人设词排前面，方便排障）
-      return [...new Set([...persona, ...global, ...extra]
+      const merged = [...new Set([...persona, ...global, ...extra]
         .map((w) => String(w).trim().toLowerCase()).filter(Boolean))]
+      // 再套她按喜好调的（加/删）—— 与控制台、gate-wake 看到的是同一份
+      try {
+        if (gid == null || gid === '') return merged
+        const home = String(process.env.DSH_HOME || '').trim() || join(homedir(), '.dsh')
+        return [...new Set(applyOverrides(merged, overridesFor(home, gid)))]
+      } catch {
+        return merged
+      }
     }
 
     /** 控制台「群聊」用：唤醒词实际用哪份、人设词表、配置全局词表 */

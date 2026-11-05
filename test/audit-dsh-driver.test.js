@@ -103,13 +103,42 @@ test('6. fetchGroupContext 增量水位：不重复旧消息、排除本条、�
   ]
   const ev = { chatKey: `group:${GROUP_ID}`, groupId: GROUP_ID, messageId: 14 }
   const all = await h.kernel.dsh.fetchGroupContext(ev, 5)
-  assert.ok(all.includes('旧消息一') && all.includes('旧消息二') && all.includes('新消息'), '首次给基线')
-  assert.equal(all.includes('[群聊上文]'), true, 'historyBlock 自带前缀')
+  const allText = typeof all === 'string' ? all : all.block
+  assert.ok(allText.includes('旧消息一') && allText.includes('旧消息二') && allText.includes('新消息'), '首次给基线')
+  assert.equal(allText.includes('[群聊上文]'), true, 'historyBlock 自带前缀')
   // 推进水位到 12 → 只应给 13 之后的新消息
   h.kernel.state.get(ev.chatKey).lastContextId = 12
   const inc = await h.kernel.dsh.fetchGroupContext(ev, 5)
-  assert.ok(inc.includes('新消息'), '水位之后的新消息要给')
-  assert.equal(inc.includes('旧消息一'), false, '水位之前的旧消息不重复')
+  const incText = typeof inc === 'string' ? inc : inc.block
+  assert.ok(incText.includes('新消息'), '水位之后的新消息要给')
+  assert.equal(incText.includes('旧消息一'), false, '水位之前的旧消息不重复')
+})
+
+test('6b. fetchGroupContext 把上文里的图都捞出来（含表情包 + 标记）', async (t) => {
+  const h = await boot(t)
+  const now = Math.floor(Date.now() / 1000)
+  h.kernel.napcat.groupHistory = async () => [
+    { message_id: 21, time: now - 60, sender: { user_id: MEMBER_QQ, nickname: '群友甲' }, message: [
+      { type: 'text', data: { text: '看我拍的' } },
+      { type: 'image', data: { url: 'https://example.com/a.jpg', file: 'a.image' } },
+    ] },
+    { message_id: 22, time: now - 50, sender: { user_id: MEMBER_QQ, nickname: '群友乙' }, message: [
+      { type: 'image', data: { url: 'https://example.com/b.jpg', file: 'b.image', sub_type: 1, summary: '[动画表情]' } },
+    ] },
+    { message_id: 23, time: now - 5, sender: { user_id: ADMIN_QQ, nickname: '主人' }, message: [
+      { type: 'image', data: { url: 'https://example.com/c.jpg', file: 'c.image' } },
+    ] },
+  ]
+  const ev = { chatKey: `group:${GROUP_ID}`, groupId: GROUP_ID, messageId: 24 }
+  const res = await h.kernel.dsh.fetchGroupContext(ev, 5)
+  assert.equal(typeof res, 'object', '新版返回 { block, images }')
+  assert.equal(res.images.length, 3, '三张图全收（含表情包 —— 否则她读不到表情）')
+  assert.equal(res.images[0].url, 'https://example.com/a.jpg', '按时间顺序')
+  assert.equal(res.images[0].who, '群友甲', '带发送者，方便模型知道是谁发的')
+  const sticker = res.images.find((x) => String(x.url).includes('b.jpg'))
+  assert.ok(sticker, '表情包也要收进来')
+  assert.equal(sticker.isSticker, true, '表情包要打 isSticker 标记（上层据此排优先级）')
+  assert.equal(res.images.filter((x) => x.isSticker).length, 1, '只有一张是表情包')
 })
 
 test('7. syncSessionTitles：标题同步成「群名 (群号)」；失败不中断', async (t) => {

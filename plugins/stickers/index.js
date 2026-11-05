@@ -100,6 +100,45 @@ function readIndex(dir) {
   }
 }
 
+let _prefsToken = null
+/** 读面板服务的共享令牌。
+ *  ⚠️ 只有**读到非空**才缓存：面板服务晚于机器人启动时令牌文件可能还不存在，
+ *     早期版本会把空串永久缓存 → 本进程再也发不出喜好反馈。 */
+function prefsToken(cfg) {
+  if (_prefsToken) return _prefsToken
+  try {
+    const p = String(cfg?.prefsTokenFile || '/home/ubuntu/sticker-admin/overrides/plugin-token')
+    const v = fs.readFileSync(p, 'utf8').trim()
+    if (v) _prefsToken = v
+    return v
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 从候选里按「喜好分」加权挑一张：pref 越高越容易被挑中（平方放大，让"真爱"更突出）。
+ * 纯函数、可注入随机源，便于自检。
+ * @param {Array<{id:number,pref?:number}>} items
+ * @param {() => number} rand 0~1 随机源
+ */
+export function pickWeighted(items, rand = Math.random) {
+  if (!Array.isArray(items) || !items.length) return null
+  const weights = items.map((i) => {
+    const n = Number(i.pref)
+    const p = Number.isFinite(n) ? Math.max(1, Math.min(100, n)) : 50
+    return p * p
+  })
+  const total = weights.reduce((a, b) => a + b, 0)
+  if (!(total > 0)) return items[Math.floor(rand() * items.length)] || null
+  let r = rand() * total
+  for (let k = 0; k < items.length; k += 1) {
+    r -= weights[k]
+    if (r <= 0) return items[k]
+  }
+  return items[items.length - 1]
+}
+
 export default {
   id: 'stickers',
   title: '表情包',
@@ -115,6 +154,27 @@ export default {
     // 运行时代码仍读 cfg.tagging，内核将来补上后把这一项加回来即可。
     skipGif: { type: 'bool', default: true, group: '表情包', label: '跳过 GIF（只收静态图）',
       hint: '按内容魔数判（GIF87a/GIF89a），扩展名改成 .jpg 也拦得住；只挡新收的图' },
+    prefBias: {
+      type: 'int', default: 35, min: 0, max: 100, step: 5, unit: '%', group: '表情包', label: '挑图时按喜好偏向',
+      hint: '带关键词挑图时，以这个概率从「同标签候选」里换一张她更喜欢的（0 = 完全按标签不变）。'
+        + '无关键词的随机挑图本来就按喜好加权。',
+    },
+    feelingEnabled: {
+      type: 'bool', default: true, group: '表情包', label: '发表情后回报喜好',
+      hint: '开：她发出去之后可以顺口说「没那么喜欢/更喜欢」，插件会把喜好分调高或调低（长期会影响淘汰与挑图）。',
+    },
+    prefsEndpoint: {
+      type: 'str', default: 'http://127.0.0.1:18081', group: '表情包', label: '喜好服务地址',
+      hint: '面板服务（只本机）。默认 http://127.0.0.1:18081；没起时静默忽略，不影响发表情。',
+    },
+    prefsTokenFile: {
+      type: 'str', default: '/home/ubuntu/sticker-admin/overrides/plugin-token', group: '表情包', label: '喜好接口令牌文件',
+      hint: '面板服务只认带这个令牌的直连请求（防止从网页端乱改喜好）。一般不用改。',
+    },
+    skipGroups: {
+      type: 'group', default: [], group: '表情包', label: '不收表情的群',
+      hint: '勾上的群不采集表情包（发还是可以发）。比如闲聊灌水群、只发文字通知的群。',
+    },
     collectGroupsOnly: { type: 'bool', default: true, group: '表情包', label: '只在群里收', hint: '开：只收群聊里的表情；关：私聊里的也收。' },
     offerPercent: { type: 'int', default: 80, min: 0, max: 100, step: 1, unit: '%', group: '表情包', label: '主动想起概率',
       hint: '每轮"提醒它可以发一张"的概率（0=关）；它仍可拒绝 → 实际发出率会低于这个数' },
@@ -270,7 +330,8 @@ export default {
     function pickRandom(s) {
       const usable = readIndex(dir).items.filter((i) => !i.blocked && !i.adult && i.file)
       if (!usable.length) return null
-      const it = usable[Math.floor(Math.random() * usable.length)]
+      // 按喜好加权：pref 越高越容易被挑中
+      const it = pickWeighted(usable) || usable[usable.length - 1]
       const p = path.join(dir, it.file)
       if (!fs.existsSync(p)) return null // 手删的（prune 通常已清掉，这里只挡竞态）
       if (it.tagged) { const r = s.resolve('#' + it.id); if (r && r.path) return r }
@@ -287,6 +348,27 @@ export default {
       if ((!hit || !hit.path) && pointed) hit = pickById(s, q)
       if ((!hit || !hit.path) && !pointed) hit = pickRandom(s)
       if (!hit || !hit.path) return { ok: false, reason: '没合适的' }
+
+      // 喜好偏向：带关键词时也照顾她的口味 —— 以一定概率从「同标签候选」里按喜好换一张
+      const bias = Math.max(0, Math.min(100, Number(cfg.prefBias ?? 35)))
+      if (!pointed && bias > 0 && Math.random() * 100 < bias) {
+        const toks = String(q).split(/[\s,，/|]+/).map((x) => x.trim()).filter(Boolean)
+        const pool = readIndex(dir).items.filter((i) => {
+          if (i.blocked || i.adult || !i.file) return false
+          const tags = Array.isArray(i.tags) ? i.tags : []
+          return toks.length ? tags.some((t) => toks.some((tk) => String(t).includes(tk) || tk.includes(String(t)))) : true
+        })
+        if (pool.length > 1) {
+          const nicer = pickWeighted(pool)
+          if (nicer && nicer.id !== hit.id) {
+            const alt = pickById(s, '#' + nicer.id)
+            if (alt && alt.path) {
+              log.debug(`[表情] 喜好偏向：「${q}」命中 #${hit.id} → 换成 #${alt.id}（pref ${nicer.pref ?? 50}）`)
+              hit = alt
+            }
+          }
+        }
+      }
       return { ok: true, id: hit.id, path: hit.path, untagged: !!hit.untagged, desc: hit.desc || '', use: hit.use || '', tags: hit.tags || [] }
     }
 
@@ -343,6 +425,8 @@ export default {
     bot.on('passive-tap', (ev) => {
       if (cfg.enabled === false) return
       if (cfg.collectGroupsOnly !== false && !ev.isGroup) return
+      // 群黑名单：她在群设置里勾了"不收表情"的群直接跳过
+      if (ev.isGroup && (Array.isArray(cfg.skipGroups) ? cfg.skipGroups.map(String) : []).includes(String(ev.groupId))) return
       // 直接从**原始段**读协议字段：这条判据是我们自己钉的，不借道适配器算好的 ev.images[].isSticker（防它改宽）
       const segs = (ev.rawSegments || []).filter((s) => s && s.type === 'image' && isStickerSeg(s))
       if (!segs.length) return
@@ -386,6 +470,11 @@ export default {
       parameters: {
         query: { type: 'string', description: '关键词/心情（如「无语」「猫」「夸人」），或 `#12` 点名编号；不传 = 随便挑一张' },
         text: { type: 'string', description: '随图发的一句文字，一般不用给' },
+        feeling: {
+          type: 'string',
+          description: '可选：发完之后你自己对这张的感觉 —— like（更喜欢了）/ meh（没那么喜欢了）。'
+            + '只在你确实有感觉时才传，别每张都传。会调整这张在你心里的喜好分。',
+        },
       },
       async execute(args) {
         const turn = bot.currentTurn()
@@ -404,6 +493,24 @@ export default {
         turn.stickersSent = (turn.stickersSent || 0) + 1
         if (turn.wakeKind === 'proactive') turn.proactiveMessages = (Number(turn.proactiveMessages) || 0) + 1
         log.info(`[表情] 发出 #${hit.id}${hit.untagged ? '(新收未打标)' : ''} → ${target} (${(hit.tags || []).join('/') || hit.desc || '无标注'})`)
+        // 喜好反馈：她说「更喜欢/没那么喜欢」→ 调整这张的喜好分（失败静默）
+        const feeling = String(args?.feeling || '').trim().toLowerCase()
+        if (feeling && cfg.feelingEnabled !== false) {
+          const ep = String(cfg.prefsEndpoint || 'http://127.0.0.1:18081').replace(/\/+$/, '')
+          try {
+            const tok = prefsToken(cfg)
+            if (!tok) throw new Error('没有令牌文件')
+            await fetch(`${ep}/api/prefs/rate`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', 'x-sticker-token': tok },
+              body: JSON.stringify({ id: hit.id, feeling }),
+              signal: AbortSignal.timeout(1500),
+            })
+            log.info(`[表情] 喜好反馈 #${hit.id} → ${feeling}`)
+          } catch (e) {
+            log.debug(`[表情] 喜好反馈失败（忽略）: ${e?.message || e}`)
+          }
+        }
         return { ok: true, target, pick: { id: hit.id, desc: hit.desc, use: hit.use, tags: hit.tags, untagged: hit.untagged } }
       },
     })
@@ -416,6 +523,7 @@ export default {
         limit: { type: 'number', description: '最多列几条，默认 30' },
       },
       execute: async (args) => queue.push(async () => {
+        if (cfg.enabled === false) return { ok: false, reason: '表情库没开' }
         const s = await shelf()
         if (!s) return { ok: true, catalog: '', stats: { enabled: cfg.enabled !== false, dir, ok: false } }
         try {

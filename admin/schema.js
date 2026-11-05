@@ -142,6 +142,27 @@ export const CORE_CONTROLS = [
     min: 0, max: 50, step: 1, default: 10,
     hint: '每轮带最近 N 条群消息给模型（旧→新、30 分钟内、排除当前条），让它接得上话。调大 = 更懂上下文但每轮更贵；自发接话轮也会带。',
   },
+  {
+    key: 'outbound.groupContextImages', group: '群聊', type: 'int', label: '上文图片张数上限',
+    min: 0, max: 30, step: 1, default: 12,
+    hint: '上文里出现的图（含表情包）也送进模型（否则它只看到「[图片]」「[表情]」）。这里是安全阀：上限内有多少带多少，超出只留最新的。'
+      + '表情包不计入（已转成 [表情:名]）。0 = 一律不带图。每张约 1k token，调大明显更贵。',
+  },
+  {
+    key: 'outbound.groupContextStickers', group: '群聊', type: 'bool', label: '上文表情包也当图带上', default: true,
+    hint: '开：群里发的表情包会**作为图片**送进模型（她才能读到表情本身，而不是只看到「[表情]」）。'
+      + '关：只带照片/截图这类真图。表情包比真图多，额度里真图优先、表情补位。',
+  },
+  {
+    key: 'outbound.groupContextImageMaxAgeMin', group: '群聊', type: 'int', label: '上文图片只带多久内的',
+    min: 1, max: 120, step: 1, default: 30, unit: '分钟',
+    hint: '太老的图和人眼对不上（话题早换了）。默认 30 分钟，与「群聊上文条数」的 30 分钟窗口一致。',
+  },
+  {
+    key: 'outbound.imagePartsMax', group: '群聊', type: 'int', label: '单轮总图上限',
+    min: 1, max: 30, step: 1, default: 12,
+    hint: '当前消息的图 + 上文图合计最多送几张，超出丢弃最旧的。防止极端情况（10 条上下文每条 9 张图）把请求撑爆。',
+  },
 
   // ── 静默合批（连发的几条并成一轮）──────────────────────────
   {
@@ -201,6 +222,26 @@ export const CORE_CONTROLS = [
     hint: '群里没人说话超过这么久、又到了机会点 → 可能主动起个话头。',
   },
   {
+    key: 'pacing.reply.repeatEnabled', group: '主动接话', type: 'bool', label: '复读机（跟着刷屏）',
+    default: true,
+    hint: '开：群里连着几个人刷同一句话时，它跟着刷一句一模一样的（不走模型，几乎不花 token）。',
+  },
+  {
+    key: 'pacing.reply.repeatMin', group: '主动接话', type: 'int', label: '几个人刷同一句才复读', unit: '人',
+    min: 2, max: 10, step: 1, default: 3,
+    hint: '数的是窗口内「同一句话」的条数（含刚进来的那条）。',
+  },
+  {
+    key: 'pacing.reply.repeatWindowMin', group: '主动接话', type: 'int', label: '复读判定窗口', unit: '分钟',
+    min: 1, max: 30, step: 1, default: 3,
+    hint: '这些重复要发生在多少分钟内，太久了不算。',
+  },
+  {
+    key: 'pacing.reply.repeatCooldownMin', group: '主动接话', type: 'int', label: '同群复读冷却', unit: '分钟',
+    min: 1, max: 180, step: 1, default: 10,
+    hint: '同一个群两次复读至少隔这么久，防它一直跟着刷。',
+  },
+  {
     key: 'pacing.reply.sensitivity', group: '主动接话', type: 'int', label: '语境敏感度（越高越挑时机）', unit: '%',
     scale: 0.01, min: 0, max: 100, step: 5, default: 0.45,
     hint: '先给群消息按语境打分（问句、正在热聊、它很久没说话…分高；@别人、纯表情分低），分够高才接。',
@@ -209,6 +250,23 @@ export const CORE_CONTROLS = [
     key: 'pacing.reply.maxChars', group: '主动接话', type: 'int', label: '主动接话最多多少字', unit: '字',
     min: 20, max: 500, step: 10, default: 140,
     hint: '提示里要求它主动接话别太长；超了照发但会记日志。',
+  },
+  {
+    key: 'pacing.reply.timeProfiles', group: '主动接话', type: 'json', label: '按时间段覆盖参数（JSON）',
+    default: [],
+    hint: '形如 [{"from":"09:00","to":"18:00","hourlyMax":1,"sensitivity":0.85},'
+      + '{"from":"22:00","to":"02:00","hourlyMax":10,"sensitivity":0.3}]。跨零点用 from>22:00 to<02:00 写法。'
+      + '可覆盖 hourlyMax/minGapMs/topicWindowMs/topicMinMsgs/sensitivity/coldSilenceMs/silenceEnabled/'
+      + 'repeatEnabled/repeatMin/repeatWindowMin/repeatCooldownMin/maxChars。'
+      + '优先级：群覆盖 > 时间段 > 全局。⚠️ 用面板「群体节奏」页改更直观。',
+  },
+  {
+    key: 'pacing.reply.groupOverrides', group: '主动接话', type: 'json', label: '按群覆盖参数（JSON）',
+    default: {},
+    hint: '形如 {"1049951647":{"hourlyMax":2,"sensitivity":0.8,"repeatEnabled":false}}。'
+      + '可覆盖：enabled/hourlyMax/minGapMs/topicWindowMs/topicMinMsgs/sensitivity/coldSilenceMs/'
+      + 'silenceEnabled/repeatEnabled/repeatMin/repeatWindowMin/repeatCooldownMin。没写的字段沿用全局。'
+      + '⚠️ 用面板「群聊」页的群卡片改更直观。',
   },
   {
     key: 'pacing.reply.groups', group: '主动接话', type: 'group', label: '允许主动接话的群',
@@ -531,6 +589,18 @@ export function coercePanel(entry, raw) {
     const v = raw == null ? '' : String(raw)
     const hit = (entry.options || []).some((o) => String(o && o.value !== undefined ? o.value : o) === v)
     if (!hit) throw new Error(`${key} 不在可选项里：${v}`)
+    return v
+  }
+  if (entry.type === 'json') {
+    // 对象/数组类配置（例如按群覆盖表）：接受对象，或 JSON 字符串
+    let v = raw
+    if (typeof raw === 'string') {
+      const t = raw.trim()
+      if (!t) return entry.default && typeof entry.default === 'object' ? entry.default : {}
+      try { v = JSON.parse(t) } catch { throw new Error(`${key} 需要合法 JSON`) }
+    }
+    if (v === null || typeof v !== 'object') throw new Error(`${key} 需要对象或数组`)
+    if (JSON.stringify(v).length > 20000) throw new Error(`${key} 内容太大`)
     return v
   }
   if (entry.type === 'group') {

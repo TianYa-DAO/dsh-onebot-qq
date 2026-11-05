@@ -197,7 +197,19 @@ function buildPluginCfg(plugin, runtime, dataDir) {
   if (id === 'gate-wake' && !(Number(cfg.adminQq) > 0)) cfg.adminQq = Number(runtime.adminQq) || 0
   // file-transfer 图片白名单：缺省 = [dataDir, 系统临时目录]（内核注入，插件里不写死任何机器路径）
   if (id === 'file-transfer' && !(Array.isArray(cfg.imageWhitelist) && cfg.imageWhitelist.length)) {
-    cfg.imageWhitelist = [dataDir, os.tmpdir()]
+    // 只给「真正放图片的目录」：数据目录里还躺着 config.json / 凭据，整个 dataDir 太宽。
+    // （插件侧还有魔数校验兜底，两层都不过就别发。）
+    const candidates = [
+      path.join(dataDir, 'qq-stickers'),
+      path.join(dataDir, 'qq-welcome-images'),
+      path.join(dataDir, 'avatars'),
+      path.join(dataDir, 'uploads'),
+      resolveTmpDir('incoming'),
+      resolveTmpDir('imagegen'),
+      os.tmpdir(),          // 入站下载/生图都可能落在临时根
+    ]
+    cfg.imageWhitelist = [...new Set(candidates.filter((d) => { try { return fs.existsSync(d) && fs.statSync(d).isDirectory() } catch { return false } }))]
+    if (!cfg.imageWhitelist.length) cfg.imageWhitelist = [os.tmpdir()]
   }
   // 回复节奏的「风格」以顶层 pacing.reply.style 为权威（控制台「主动接话」页）；插件字段作 fallback。
   const style = runtime.pacing?.reply?.style
@@ -774,8 +786,42 @@ export async function apply(ctx, bundleConfig = {}) {
     const ctxCount = Number(runtime.outbound?.groupContextCount ?? runtime.groupContextCount ?? 5)
     if (ev.isGroup && !ev.historyBlock && ctxCount > 0 && typeof dsh.fetchGroupContext === 'function') {
       try {
-        const block = await dsh.fetchGroupContext(ev, ctxCount)
+        const res = await dsh.fetchGroupContext(ev, ctxCount)
+        // 兼容两种返回：旧版直接给字符串，新版给 { block, images }
+        const block = typeof res === 'string' ? res : (res?.block || '')
         if (block) ev.historyBlock = block.replace(/^\n+/, '')
+        // ── 上文里的真图也带上（否则模型只看到 [图片]）──────────────────────────
+        // 上限是**安全阀**不是策略：上下文 10 条若每条 9 张图 = 90 张，会直接把请求撑爆。
+        const imgCap = Number(runtime.outbound?.groupContextImages ?? 12)
+        const ageMin = Number(runtime.outbound?.groupContextImageMaxAgeMin ?? 10)
+        const ctxImages = Array.isArray(res?.images) ? res.images : []
+        const stickersOn = runtime.outbound?.groupContextStickers !== false
+        if (imgCap > 0 && ctxImages.length) {
+          const cutoff = Date.now() - ageMin * 60000
+          const fresh = ctxImages.filter((im) => !im.time || im.time >= cutoff)
+            .filter((im) => stickersOn || !im.isSticker)
+          // 真图优先占额度（照片/截图信息量大），剩下的名额给表情包（最新优先）
+          const real = fresh.filter((x) => !x.isSticker).slice(-imgCap)
+          const room = Math.max(0, imgCap - real.length)
+          const stickers = fresh.filter((x) => x.isSticker).slice(-room)
+          const picked = [...real, ...(stickersOn ? stickers : [])]
+            .sort((a, b) => (Number(a.time) || 0) - (Number(b.time) || 0))
+          if (picked.length) {
+            for (const im of picked) {
+              ev.images.push({
+                url: im.url, file: im.file, isSticker: !!im.isSticker,
+                summary: im.isSticker ? '[动画表情]' : '', emojiId: '', subType: im.isSticker ? 1 : 0,
+              })
+            }
+            const who = [...new Set(picked.map((x) => x.who).filter(Boolean))].join('、')
+            const nSticker = picked.filter((x) => x.isSticker).length
+            ev._scratch.ctxImages = picked.length
+            ev.hint.push(`[上文图片] 上面群聊里有 ${picked.length} 张图`
+              + (nSticker ? `（其中 ${nSticker} 张是表情包）` : '')
+              + `，来自 ${who || '群友'}，按时间顺序附在本条消息之后 —— 它们是**上下文**，不是刚发的新图`)
+            log.info(`[上文图片] ${ev.chatKey} 附 ${picked.length} 张（表情 ${nSticker}）`)
+          }
+        }
       } catch (e) { log.warn(`拉取群上文失败: ${e.message}`) }
     }
     // 2. 引用消息正文与被引图反查（供 buildPromptText 的 quoteText 与识图使用）
@@ -830,7 +876,10 @@ export async function apply(ctx, bundleConfig = {}) {
 
     // 3. 入站图片（含被引图）三级溯源下载 → sharp 缩图(≤8000px) → 填 ev.imageParts & ev.imagePaths
     if (Array.isArray(ev.images) && ev.images.length && !ev.imageParts.length) {
+      const maxParts = Math.max(1, Number(runtime.outbound?.imagePartsMax ?? 12))
       for (const im of ev.images) {
+        if (ev.imageParts.length >= maxParts) break   // 安全阀：总图上限（当前消息 + 上文）
+        
         const file = String(im?.file || '')
         const url = String(im?.url || '')
         if (!file && !url) continue
@@ -863,6 +912,9 @@ export async function apply(ctx, bundleConfig = {}) {
           log.warn(`入站图片处理失败: ${e.message}`)
         }
       }
+    }
+    if (ev.imageParts.length && ev.wake) {
+      log.info(`[入站图片] ${ev.chatKey} → ${ev.imageParts.length} 张进模型`)
     }
   }, { order: 50, pluginId: 'kernel:context' })
 
@@ -1084,8 +1136,36 @@ export async function apply(ctx, bundleConfig = {}) {
     const ctxCount = Number(runtime.outbound?.groupContextCount ?? runtime.groupContextCount ?? 5)
     if (ctxCount > 0 && typeof dsh.fetchGroupContext === 'function') {
       try {
-        const block = await dsh.fetchGroupContext(ev, ctxCount)
+        const res = await dsh.fetchGroupContext(ev, ctxCount)
+        // ⚠️ fetchGroupContext 现在返回 { block, images }（旧版是纯字符串）。
+        //    这里曾经直接把返回值当字符串 replace() → "block.replace is not a function"，
+        //    主动接话拿不到群上文 → 她以为群里没人说话。
+        const block = typeof res === 'string' ? res : (res?.block || '')
         if (block) ev.historyBlock = block.replace(/^\n+/, '')
+        // 上文里的图也带上（主动接话也该看得到群里在聊什么、发了什么图）
+        const ctxImages = Array.isArray(res?.images) ? res.images : []
+        const imgCap = Number(runtime.outbound?.groupContextImages ?? 12)
+        const ageMin = Number(runtime.outbound?.groupContextImageMaxAgeMin ?? 10)
+        const stickersOn = runtime.outbound?.groupContextStickers !== false
+        if (imgCap > 0 && ctxImages.length) {
+          const cutoff = Date.now() - ageMin * 60000
+          const fresh = ctxImages.filter((im) => !im.time || im.time >= cutoff)
+            .filter((im) => stickersOn || !im.isSticker)
+          const real = fresh.filter((x) => !x.isSticker).slice(-imgCap)
+          const room = Math.max(0, imgCap - real.length)
+          const stickers = stickersOn ? fresh.filter((x) => x.isSticker).slice(-room) : []
+          const picked = [...real, ...stickers].sort((a, b) => (Number(a.time) || 0) - (Number(b.time) || 0))
+          for (const im of picked) {
+            ev.images.push({
+              url: im.url, file: im.file, isSticker: !!im.isSticker,
+              summary: im.isSticker ? '[动画表情]' : '', emojiId: '', subType: im.isSticker ? 1 : 0,
+            })
+          }
+          if (picked.length) {
+            ev._scratch.ctxImages = picked.length
+            log.info(`[主动接话] ${ev.chatKey} 附上文图 ${picked.length} 张`)
+          }
+        }
       } catch (e) { log.warn(`[主动接话] 拉取群上文失败: ${e.message}`) }
     }
     ev.turnCtx = createTurnContext(ev)
@@ -1093,8 +1173,18 @@ export async function apply(ctx, bundleConfig = {}) {
     log.info(`[主动接话] ${chatKey} 候选入站（${reason === 'silence' ? '冷场找话' : '话题合适'}）→ 交模型判断接不接`)
     return turnStore.run(ev.turnCtx, () => state.serialize(ev.chatKey, () => runTurn(ev)))
   }
+  // 暴露给测试与控制台：手动起一轮主动接话（正常调度仍然走 pacing）
+  kernel.runProactiveTurn = runProactiveTurn
   pacing.start({
     onProactiveTurn: runProactiveTurn,
+    // 复读机：群里在刷同一句话 → 原样跟着刷一句（不建 turn、不走模型）
+    onRepeat: async ({ chatKey, text }) => {
+      try {
+        await deliver(chatKey, text, { turnCtx: null })
+      } catch (e) {
+        log.warn(`[复读机] 发送失败 ${chatKey}: ${e.message}`)
+      }
+    },
     isBusy: (chatKey) => kernel.activeTurns.has(String(chatKey)) || hasPendingTurn(String(chatKey)),
   })
 

@@ -379,13 +379,25 @@ test('FILE-1 send_image 白名单：外部绝对路径被拒；白名单内文�
   const outside = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'qqbot-outside-')), 'a.png')
   fs.writeFileSync(outside, 'x')
   await assert.rejects(() => sendImage.execute({ target: `group:${GROUP_ID}`, file: outside }), /白名单/i)
+  // 真图片（1x1 PNG 魔数）：send_image 现在除了白名单还校验「确实是个图片文件」
+  const PNG_1PX = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==',
+    'base64')
   const inside = path.join(allowDir, 'ok.png')
-  fs.writeFileSync(inside, 'x')
+  fs.writeFileSync(inside, PNG_1PX)
   const before = h.sent.length
   const r = await sendImage.execute({ target: `group:${GROUP_ID}`, file: inside })
   assert.equal(r.ok, true)
   assert.equal(h.sent.length, before + 1, '白名单内图片经唯一出站口发出')
   assert.equal(h.sent.at(-1).kind, 'media')
+
+  // 白名单目录里但内容不是图片（比如 config.json 被塞进来）→ 必须拒绝，别把敏感文件当附件发出去
+  const fakePng = path.join(allowDir, 'secret.png')
+  fs.writeFileSync(fakePng, JSON.stringify({ token: 'aaa' }))
+  await assert.rejects(() => sendImage.execute({ target: `group:${GROUP_ID}`, file: fakePng }), /不是图片/i)
+  const notExt = path.join(allowDir, 'config.json')
+  fs.writeFileSync(notExt, '{}')
+  await assert.rejects(() => sendImage.execute({ target: `group:${GROUP_ID}`, file: notExt }), /不是图片/i)
 })
 
 test('FILE-2 QQ 只收不发文件：只注册 send_image，没有发文件工具', async (t) => {
