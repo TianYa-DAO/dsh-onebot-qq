@@ -188,6 +188,8 @@ export class Pipeline {
     if (!ev.wake) return undefined // 没唤醒 = 这条不归模型管
     // 唤醒通过才创建 TurnContext，并挂进 AsyncLocalStorage —— 贯穿 prompt/工具/出站，turn/end 时自然失效
     ev.turnCtx = createTurnContext(ev)
+    // 记下"这条消息是什么时候进来的"：出站时用它算端到端耗时（含合批等待）
+    ev.turnCtx._inboundAt = Number(ev.time) > 0 ? Number(ev.time) : Date.now()
     return turnStore.run(ev.turnCtx, () => terminal(ev))
   }
 }

@@ -19,6 +19,8 @@ import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { readJsonFile } from '../../platform/atomic.js'
 import { cqImage } from '../../platform/cq-file.js'
+// 有界媒体读取：表情单张上限 2MB，边读边掐（不信声明的 size）
+import { readLocalBytes, fetchBytes as downloadBytes } from '../../kernel/media-bytes.js'
 
 // 用随包自带的 vendor 核心（保证移植时零外部路径依赖），可通过环境变量覆盖（本地调试上游用）。
 const BUNDLED_VENDOR = fileURLToPath(new URL('../../vendor/dsh-sticker-shelf.mjs', import.meta.url))
@@ -122,6 +124,26 @@ function prefsToken(cfg) {
  * @param {Array<{id:number,pref?:number}>} items
  * @param {() => number} rand 0~1 随机源
  */
+/**
+ * 泛化标签：当检索词命中这些词时**不算数**（"表情包/搞笑/可爱"这种谁都长一个样）。
+ * 摘自上游戏 2026-10-29：挑图要"忽略泛化元标签、优先具体标签"，否则模型说"来个搞笑的"永远抽到同一批。
+ */
+const GENERIC_TAGS = new Set([
+  '表情', '表情包', '图片', '动图', '搞笑', '好笑', '开心', '可爱', '萌', '沙雕', '魔性',
+  'meme', 'gif', 'sticker', 'emotion', 'cute', 'funny', '其他', '杂', '日常',
+])
+const isGenericTag = (t) => GENERIC_TAGS.has(String(t || '').trim().toLowerCase())
+
+/**
+ * 一个标签有多"具体"：越长越具体（"阴阳怪气" > "搞笑"）；泛化标签记 0 分。
+ * 用来在多个候选里优先挑"标签更贴题"的那张。
+ */
+const tagSpecificity = (t) => {
+  const v = String(t || '').trim()
+  if (!v || isGenericTag(v)) return 0
+  return Math.min(8, v.length)
+}
+
 export function pickWeighted(items, rand = Math.random) {
   if (!Array.isArray(items) || !items.length) return null
   const weights = items.map((i) => {
@@ -238,27 +260,20 @@ export default {
      */
     async function fetchBytes(file, url) {
       const tried = []
+      const limits = { maxBytes: 2 * 1024 * 1024, timeoutMs: 15000 } // 单张 ≤2MB，边读边掐
       const local = String(file || '')
       if (local && fs.existsSync(local)) {
-        try { if (fs.statSync(local).isFile()) return fs.readFileSync(local) } catch (e) { tried.push(`本地读取失败 ${e.message}`) }
+        try { if (fs.statSync(local).isFile()) return await readLocalBytes(local, limits) } catch (e) { tried.push(`本地读取失败 ${e.message}`) }
       }
       if (local && !/^https?:\/\//.test(local) && typeof bot.napcat?.getFile === 'function') {
         try {
           const info = await bot.napcat.getFile(local)
-          if (info?.file && fs.existsSync(info.file) && fs.statSync(info.file).isFile()) return fs.readFileSync(info.file)
-          if (info?.url && /^https?:\/\//.test(info.url)) {
-            const r = await fetch(info.url, { signal: AbortSignal.timeout(15000) })
-            if (r.ok) return Buffer.from(await r.arrayBuffer())
-            tried.push(`溯源直链 HTTP ${r.status}`)
-          }
+          if (info?.file && fs.existsSync(info.file) && fs.statSync(info.file).isFile()) return await readLocalBytes(info.file, limits)
+          if (info?.url && /^https?:\/\//.test(info.url)) return await downloadBytes(info.url, limits)
         } catch (e) { tried.push(`get_file ${e.message}`) }
       }
       const link = /^https?:\/\//.test(String(url || '')) ? url : (/^https?:\/\//.test(local) ? local : '')
-      if (link) {
-        const res = await fetch(link, { signal: AbortSignal.timeout(15000) })
-        if (res.ok) return Buffer.from(await res.arrayBuffer())
-        tried.push(`直链 HTTP ${res.status}`)
-      }
+      if (link) return await downloadBytes(link, limits)
       throw new Error(tried.join(' / ') || '没有可用的图片来源')
     }
 
@@ -339,7 +354,15 @@ export default {
     }
 
     /** 挑一张（在队列里跑）。关键词没命中 → 随便给一张；点名没找到 → 如实说没合适的。 */
-    async function pickLocked(s, query) {
+    // 同一个会话最近发过哪几张：用来避免"连着两条都是同一张图"
+    const lastSent = new Map()   // chatKey → [id, id]（保留最近 2 个）
+    function noteSent(chatKey, id) {
+      const key = String(chatKey || '_')
+      const arr = lastSent.get(key) || []
+      arr.unshift(id)
+      lastSent.set(key, arr.slice(0, 2))
+    }
+    async function pickLocked(s, query, target = '') {
       await pruneLocked(s)
       const q = String(query || '').trim()
       const pointed = /^#?\d{1,4}$/.test(q) // `#12` / `12` = 点名
@@ -352,14 +375,24 @@ export default {
       // 喜好偏向：带关键词时也照顾她的口味 —— 以一定概率从「同标签候选」里按喜好换一张
       const bias = Math.max(0, Math.min(100, Number(cfg.prefBias ?? 35)))
       if (!pointed && bias > 0 && Math.random() * 100 < bias) {
-        const toks = String(q).split(/[\s,，/|]+/).map((x) => x.trim()).filter(Boolean)
+        // 检索词里滤掉泛化词（"来个搞笑的猫" → 只留 "猫"）
+        const allToks = String(q).split(/[\s,，/|]+/).map((x) => x.trim()).filter(Boolean)
+        const toks = allToks.filter((t) => !isGenericTag(t))
+        const useToks = toks.length ? toks : allToks
         const pool = readIndex(dir).items.filter((i) => {
           if (i.blocked || i.adult || !i.file) return false
-          const tags = Array.isArray(i.tags) ? i.tags : []
-          return toks.length ? tags.some((t) => toks.some((tk) => String(t).includes(tk) || tk.includes(String(t)))) : true
+          const tags = (Array.isArray(i.tags) ? i.tags : []).filter((t) => !isGenericTag(t))
+          if (!useToks.length) return tags.length > 0      // 没关键词：只在"有具体标签"的图里挑
+          return tags.some((t) => useToks.some((tk) => String(t).includes(tk) || tk.includes(String(t))))
         })
         if (pool.length > 1) {
-          const nicer = pickWeighted(pool)
+          // 具体标签命中的优先：把"标签更贴题"的权重抬高（喜好分仍是主因，平方放大保持）
+          const scored = pool.map((i) => {
+            const tags = (Array.isArray(i.tags) ? i.tags : []).filter((t) => !isGenericTag(t))
+            const spec = Math.max(0, ...tags.map((t) => (useToks.some((tk) => String(t).includes(tk) || tk.includes(String(t))) ? tagSpecificity(t) : 0)))
+            return { ...i, pref: (Number.isFinite(Number(i.pref)) ? Math.max(1, Math.min(100, Number(i.pref))) : 50) * (1 + spec / 4) }
+          })
+          const nicer = pickWeighted(scored)
           if (nicer && nicer.id !== hit.id) {
             const alt = pickById(s, '#' + nicer.id)
             if (alt && alt.path) {
@@ -367,6 +400,14 @@ export default {
               hit = alt
             }
           }
+        }
+      }
+      // 避免"连着两条都是同一张"：同一会话最近发过的最多再抽 2 次
+      const recent = lastSent.get(String(target || '_')) || []
+      if (!pointed && recent.includes(hit.id)) {
+        for (let retry = 0; retry < 2; retry += 1) {
+          const alt = wantsRandom ? pickRandom(s) : (s.resolve(q) || pickRandom(s))
+          if (alt && alt.path && !recent.includes(alt.id)) { hit = alt; break }
         }
       }
       return { ok: true, id: hit.id, path: hit.path, untagged: !!hit.untagged, desc: hit.desc || '', use: hit.use || '', tags: hit.tags || [] }
@@ -409,12 +450,12 @@ export default {
     }
 
     /** 挑图（工具与自检共用；所有触碰索引的动作都走这条队列）。 */
-    async function pick(query) {
+    async function pick(query, target = '') {
       if (cfg.enabled === false) return { ok: false, reason: '表情库没开' }
       return queue.push(async () => {
         const s = await shelf()
         if (!s) return { ok: false, reason: '表情库不可用' }
-        try { return await pickLocked(s, query) } catch (e) {
+        try { return await pickLocked(s, query, target) } catch (e) {
           log.warn(`[表情] 挑图失败: ${e.message}`)
           return { ok: false, reason: '挑图出错' }
         }
@@ -459,6 +500,52 @@ export default {
     })
 
     // ── 入口 ③：工具 send_sticker（一轮最多 maxPerTurn 张；target 取当前 TurnContext，不信模型传） ──
+    /**
+     * 发一张表情（内核 send_message 的 sticker 参数也走这里）。
+     * 与 send_sticker 工具同一套规矩：每轮上限、主动接话一轮最多 2 条、喜好反馈。
+     * @returns {Promise<{ok:boolean, id?:number, tags?:string[], reason?:string}>}
+     */
+    async function sendStickerTo({ target, query = '', text = '', turnCtx = null, feeling = '' } = {}) {
+      const turn = turnCtx || bot.currentTurn()
+      const chatKey = String(target || turn?.chatKey || '')
+      if (!chatKey) return { ok: false, reason: '没有进行中的会话（只能在回话轮里发）' }
+      const cap = maxPerTurn()
+      if ((turn?.stickersSent || 0) >= cap) return { ok: false, reason: `这轮已经发过 ${turn.stickersSent} 张了（每轮上限 ${cap}）` }
+      // 主动接话一轮最多 2 条（与内核出站钩子同一条规矩；表情包也算一条）
+      if (turn?.wakeKind === 'proactive' && (Number(turn.proactiveMessages) || 0) >= 2) {
+        return { ok: false, reason: '主动接话这轮已经发满 2 条了，别再发' }
+      }
+      const hit = await pick(query, chatKey)
+      if (!hit.ok) return hit
+      noteSent(chatKey, hit.id)
+      // 说明文字原样交给内核（脱敏 / CQ 转义是 sendMedia → deliver 的事，插件不写第二份）
+      await bot.sendMedia(chatKey, cqImage(hit.path), text || '')
+      if (turn) {
+        turn.stickersSent = (turn.stickersSent || 0) + 1
+        if (turn.wakeKind === 'proactive') turn.proactiveMessages = (Number(turn.proactiveMessages) || 0) + 1
+      }
+      log.info(`[表情] 发出 #${hit.id}${hit.untagged ? '(新收未打标)' : ''} → ${chatKey} (${(hit.tags || []).join('/') || hit.desc || '无标注'})`)
+      // 喜好反馈：她说「更喜欢/没那么喜欢」→ 调整这张的喜好分（失败静默）
+      const f = String(feeling || '').trim().toLowerCase()
+      if (f && cfg.feelingEnabled !== false) {
+        const ep = String(cfg.prefsEndpoint || 'http://127.0.0.1:18081').replace(/\/+$/, '')
+        try {
+          const tok = prefsToken(cfg)
+          if (!tok) throw new Error('没有令牌文件')
+          await fetch(`${ep}/api/prefs/rate`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-sticker-token': tok },
+            body: JSON.stringify({ id: hit.id, feeling: f }),
+            signal: AbortSignal.timeout(1500),
+          })
+        } catch (e) { log.debug(`[表情] 喜好反馈失败（不影响发送）: ${e.message}`) }
+      }
+      return { ok: true, id: hit.id, tags: hit.tags || [], text: hit.text || '' }
+    }
+
+    // 内核 send_message 的 sticker 参数通过这个入口顺手带一张（没装/没开就由内核如实说）
+    bot.shared.stickerSend = ({ target, query, turnCtx }) => sendStickerTo({ target, query, turnCtx })
+
     bot.registerTool('send_sticker', {
       description: '从群里攒下来的表情包库里挑一张发出去（库里的图都是群里真实发过的，带标签）。'
         + '表情包多数时候只是语气（敷衍/赞同/无语/看热闹）或图一乐 —— 想发就发，不必给它找理由。'
@@ -477,41 +564,14 @@ export default {
         },
       },
       async execute(args) {
-        const turn = bot.currentTurn()
-        const target = turn?.chatKey
-        if (!target) return { ok: false, reason: '没有进行中的会话（send_sticker 只能在回话轮里用）' }
-        const cap = maxPerTurn()
-        if ((turn.stickersSent || 0) >= cap) return { ok: false, reason: `这轮已经发过 ${turn.stickersSent} 张了（每轮上限 ${cap}）` }
-        // 主动接话一轮最多 2 条（与内核出站钩子同一条规矩；表情包也算一条）
-        if (turn.wakeKind === 'proactive' && (Number(turn.proactiveMessages) || 0) >= 2) {
-          return { ok: false, reason: '主动接话这轮已经发满 2 条了，别再发' }
-        }
-        const hit = await pick(args?.query ?? args?.mood ?? '')
-        if (!hit.ok) return hit
-        // 说明文字原样交给内核（脱敏 / CQ 转义是 sendMedia → deliver 的事，插件不写第二份）
-        await bot.sendMedia(target, cqImage(hit.path), args?.text || '')
-        turn.stickersSent = (turn.stickersSent || 0) + 1
-        if (turn.wakeKind === 'proactive') turn.proactiveMessages = (Number(turn.proactiveMessages) || 0) + 1
-        log.info(`[表情] 发出 #${hit.id}${hit.untagged ? '(新收未打标)' : ''} → ${target} (${(hit.tags || []).join('/') || hit.desc || '无标注'})`)
-        // 喜好反馈：她说「更喜欢/没那么喜欢」→ 调整这张的喜好分（失败静默）
-        const feeling = String(args?.feeling || '').trim().toLowerCase()
-        if (feeling && cfg.feelingEnabled !== false) {
-          const ep = String(cfg.prefsEndpoint || 'http://127.0.0.1:18081').replace(/\/+$/, '')
-          try {
-            const tok = prefsToken(cfg)
-            if (!tok) throw new Error('没有令牌文件')
-            await fetch(`${ep}/api/prefs/rate`, {
-              method: 'POST',
-              headers: { 'content-type': 'application/json', 'x-sticker-token': tok },
-              body: JSON.stringify({ id: hit.id, feeling }),
-              signal: AbortSignal.timeout(1500),
-            })
-            log.info(`[表情] 喜好反馈 #${hit.id} → ${feeling}`)
-          } catch (e) {
-            log.debug(`[表情] 喜好反馈失败（忽略）: ${e?.message || e}`)
-          }
-        }
-        return { ok: true, target, pick: { id: hit.id, desc: hit.desc, use: hit.use, tags: hit.tags, untagged: hit.untagged } }
+        const res = await sendStickerTo({
+          target: bot.currentTurn()?.chatKey,
+          query: args?.query ?? args?.mood ?? '',
+          text: args?.text || '',
+          feeling: args?.feeling || '',
+        })
+        if (!res.ok) return res
+        return { ok: true, id: res.id, tags: res.tags }
       },
     })
 

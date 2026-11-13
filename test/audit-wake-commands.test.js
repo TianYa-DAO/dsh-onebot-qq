@@ -278,6 +278,8 @@ test('WAKE-RECALL 引用 + 「撤回」：单条撤回成功即回执，且同�
     recalled.push(Number(id))
     return { ok: true }
   }
+  // 闸 ②：被引消息必须是本机自己发的（2026-11-09 上游线上误撤修复，我们同步摘了）
+  h.kernel.napcat.msgById = async () => ({ message_id: 777, sender: { user_id: h.kernel.napcat.selfId }, message: [] })
   const recallEvent = (id) => ({
     post_type: 'message',
     message_type: 'group',
@@ -300,23 +302,35 @@ test('WAKE-RECALL 引用 + 「撤回」：单条撤回成功即回执，且同�
 // 命令
 // ─────────────────────────────────────────────────────────────────────────────
 
-test('CMD-1 /help：任意人可用，从命令表动态生成，零 token', async (t) => {
+// ⚠️ 本地 fork 有意改动（上游测试未同步）：
+//    · /help 也设成 master 权限（上游是"任意人可用"）
+//    · 非主人调用一律**静默吞掉**（上游是回一句"只有主人"）—— 避免别人打个 /help 就把机器人叫出来
+//    所以这两个用例按本地意图重写；产品行为如需改回上游语义，改插件再改回这里。
+test('CMD-1 /help：主人可用，从命令表动态生成，零 token', async (t) => {
   const h = await boot(t)
-  await emitRaw(h.kernel, memberGroupEvent('/help', { id: 30 }))
+  await emitRaw(h.kernel, groupAtEvent({ text: '/help', messageId: 30 }))   // 主人（ADMIN_QQ）
   await waitFor(() => h.sent.length === 1, { label: '/help 回复' })
   const text = h.sent[0].wire
   for (const cmd of ['/status', '/reset', '/cancel', '/history']) assert.ok(text.includes(cmd), `应列出 ${cmd}`)
   assert.equal(h.ctx._prompts.length, 0, '/help 不进模型')
 })
 
-test('CMD-2 非主人调用主人命令一律被拒', async (t) => {
+test('CMD-1b /help：非主人被静默吞掉（不回字、不进模型）', async (t) => {
+  const h = await boot(t)
+  await emitRaw(h.kernel, memberGroupEvent('/help', { id: 30 }))
+  await sleep(300)
+  assert.equal(h.sent.length, 0, '非主人拿不到 /help 回执')
+  assert.equal(h.ctx._prompts.length, 0, '也不进模型')
+})
+
+test('CMD-2 非主人调用主人命令：静默拒绝（不回字、不起轮）', async (t) => {
   const h = await boot(t)
   for (const cmd of ['/status', '/reset', '/resetall confirm', '/cancel', '/quota']) {
     await emitRaw(h.kernel, memberGroupEvent(cmd, { id: 31 }))
   }
-  await waitFor(() => h.sent.length >= 5, { label: '拒绝回执' })
-  for (const s of h.sent) assert.ok(s.wire.includes('只有主人'), `应拒绝：${s.wire}`)
-  assert.equal(h.ctx._prompts.length, 0)
+  await sleep(400)
+  assert.equal(h.sent.length, 0, '非主人的主人命令一律不回字（静默）')
+  assert.equal(h.ctx._prompts.length, 0, '也不进模型')
 })
 
 test('CMD-3 /status 主人：显示本线会话', async (t) => {

@@ -166,6 +166,18 @@ export const CORE_CONTROLS = [
 
   // ── 静默合批（连发的几条并成一轮）──────────────────────────
   {
+    key: 'outbound.maxPerWindow', group: '消息设置', type: 'int', label: '5 分钟内最多发几条（兜底保险丝）',
+    min: 3, max: 50, step: 1, default: 15,
+    hint: '同一个会话 5 分钟内最多发这么多条，超过就拦。**0 = 不限**（默认关闭）。'
+      + '正常连聊也很少超过 15 条/5 分钟；如果嫌紧就调大。',
+  },
+  {
+    key: 'outbound.maxMessagesPerTurn', group: '消息设置', type: 'int', label: '一轮最多发几条（保险丝）',
+    min: 1, max: 20, step: 1, default: 6,
+    hint: '同一轮回复最多发这么多条消息，超了就地拦住。**0 = 不限**（默认关闭）。'
+      + '主要防"上下文压缩发生在轮中途 → 模型忘了自己刚回过 → 重复刷屏"这种失控（线上出过一次，连发十几分钟）。',
+  },
+  {
     key: 'pacing.merge.enabled', group: '消息设置', type: 'bool', label: '静默合批（连发的几条并成一轮）', default: true,
     hint: '同一群里几百毫秒内连着叫它的几条消息并成一轮 —— 省钱、也更像“等别人说完再开口”。',
   },
@@ -183,6 +195,12 @@ export const CORE_CONTROLS = [
     key: 'pacing.merge.activeGapMs', group: '消息设置', type: 'int', label: '对话判定（距上一条多久算在聊）', unit: '毫秒',
     min: 1000, max: 120000, step: 500, default: 15000,
     hint: '上一条离这条 ≤ 本值 → 用「对话进行中」的等待窗口；否则用「冷清时」。',
+  },
+  {
+    key: 'pacing.merge.privateWindowMs', group: '消息设置', type: 'int', label: '私聊合批等待', unit: '毫秒',
+    min: 500, max: 15000, step: 500, default: 3000,
+    hint: '私聊专用：他连发几句时，安静这么久才一次性回复（每条新消息会刷新计时）。'
+      + '比群里短更跟手；调大更像是"等他写完"，调小回得更快但可能把连发拆成两轮。',
   },
   {
     key: 'pacing.merge.maxWaitMs', group: '消息设置', type: 'int', label: '合批最长等待', unit: '毫秒',
@@ -220,6 +238,130 @@ export const CORE_CONTROLS = [
     key: 'pacing.reply.coldSilenceMs', group: '主动接话', type: 'int', label: '群里安静多久算冷场', unit: '分钟',
     scale: 60000, min: 1, max: 120, step: 1, default: 180000,
     hint: '群里没人说话超过这么久、又到了机会点 → 可能主动起个话头。',
+  },
+  {
+    key: 'pacing.reply.privateAllow', group: '主动接话', type: 'group', label: '允许她主动私聊的 QQ',
+    hint: '填 QQ 号，多个用逗号分隔。她会在这人**安静够久**之后主动发一条（不是定时打卡）。'
+      + '留空 = 不主动私聊任何人。只有"聊过的人"才会被想起，从没聊过的不打扰。',
+  },
+  {
+    key: 'pacing.reply.privateColdHours', group: '主动接话', type: 'int', label: '私聊安静多久才想起他', unit: '小时',
+    min: 1, max: 72, step: 1, default: 6,
+    hint: '比群里克制：默认 6 小时没说话才主动开口。没回音会指数退避（×2/×4/×8），三次没人理就先不打扰。',
+  },
+  {
+    key: 'pacing.reply.privateColdJitterMin', group: '主动接话', type: 'int', label: '私聊门槛的随机抖动', unit: '分钟',
+    min: 0, max: 180, step: 5, default: 30,
+    hint: '把「私聊安静多久才想起他」上下浮动这么多（按人、按天不同）。'
+      + '默认 ±30 分钟：有时 5 个半小时就想起来，有时 6 个半小时。0 = 固定门槛不抖。',
+  },
+  {
+    key: 'pacing.reply.desire.enabled', group: '自主起念', type: 'bool', label: '她可以自己想聊就聊', default: true,
+    hint: '开：没人叫也会偶尔"突然想说话"（按她自己记的兴趣挑话题/找人）。'
+      + '这是**她自己**的念头 —— 她会用 interest_note 工具记下喜欢的话题和人。',
+  },
+  {
+    key: 'pacing.reply.desire.minGapMin', group: '自主起念', type: 'int', label: '两次自主起念至少间隔', unit: '分钟',
+    min: 30, max: 720, step: 10, default: 150,
+    hint: '别让她一直自己找话说。默认两个半小时。',
+  },
+  {
+    key: 'pacing.reply.desire.hourlyMax', group: '自主起念', type: 'int', label: '每小时最多自主起念', unit: '次',
+    min: 0, max: 6, step: 1, default: 1,
+    hint: '每小时最多几次。0 = 完全禁止自主起念（退化成只按冷场/话题调度）。',
+  },
+  {
+    key: 'pacing.reply.desire.nightWakePct', group: '自主起念', type: 'int', label: '半夜醒来的概率', unit: '%',
+    min: 0, max: 100, step: 1, default: 12,
+    hint: '她睡着时，每晚有多大概率**自己醒来**一会儿（像人半夜睡不着刷手机）。'
+      + '醒来这段时间她是清醒的：能主动说话、也能回话；过一会儿再睡。0 = 从不夜醒。',
+  },
+  {
+    key: 'pacing.reply.desire.awakeMinMin', group: '自主起念', type: 'int', label: '夜醒至少清醒', unit: '分钟',
+    min: 5, max: 180, step: 5, default: 20,
+    hint: '半夜醒来至少清醒这么久（这段时间消息她会回）。',
+  },
+  {
+    key: 'pacing.reply.desire.awakeMaxMin', group: '自主起念', type: 'int', label: '夜醒最多清醒', unit: '分钟',
+    min: 10, max: 300, step: 10, default: 60,
+    hint: '最多清醒这么久，然后回去睡。',
+  },
+  {
+    key: 'pacing.reply.quiet.enabled', group: '主动接话', type: 'bool', label: '夜里她也要睡（免打扰）', default: true,
+    hint: '开：她的「睡觉时间」里不再主动找话；群里正有人聊时照旧能接（熬夜）。'
+      + '注意：睡觉时有人叫她，她会**先不回**、醒了再逐条回（见「叫她也不回」）。',
+  },
+  {
+    key: 'pacing.reply.quiet.wakeOnCall', group: '主动接话', type: 'bool', label: '睡觉时有人叫她也不回（醒了再补）',
+    default: true,
+    hint: '开：睡着时被叫醒的消息先攒着，等她"醒"了再逐条回（像真人睡着不看手机）。'
+      + '关：任何时间被叫都立刻回（免打扰只管"主动找话"）。',
+  },
+  {
+    key: 'pacing.reply.quiet.baseBedtime', group: '主动接话', type: 'str', label: '她平时的睡点', default: '02:30',
+    hint: '基线睡点（本地时间 HH:MM）。实际睡点是**从前一天接着走**的随机游走，不是每天在这个点上下抖。',
+  },
+  {
+    key: 'pacing.reply.quiet.baseSleepHours', group: '主动接话', type: 'float', label: '她平时睡多久', unit: '小时',
+    min: 3, max: 12, step: 0.5, default: 7.5,
+    hint: '基线睡眠时长；实际每天有浮动（见「时长浮动」），并会被回拉到这个值附近。',
+  },
+  {
+    key: 'pacing.reply.quiet.driftMin', group: '主动接话', type: 'int', label: '作息游走幅度', unit: '分钟',
+    min: 10, max: 240, step: 10, default: 75,
+    hint: '每天睡点在"昨天"基础上随机走多少（正态）。越大越容易连续熬夜/连续早睡。',
+  },
+  {
+    key: 'pacing.reply.quiet.revertPct', group: '主动接话', type: 'int', label: '作息的回拉力', unit: '%',
+    min: 0, max: 90, step: 5, default: 30,
+    hint: '每天往基线睡点拉回多少（像真人被上班/上学拉回来）。0 = 纯随机游走（可能一路漂到天亮）。',
+  },
+  {
+    key: 'pacing.reply.quiet.durationJitterMin', group: '主动接话', type: 'int', label: '睡眠时长浮动', unit: '分钟',
+    min: 5, max: 120, step: 5, default: 35,
+    hint: '每天睡眠时长在基线附近的抖动幅度（正态）。正常人幅度不大，建议 20~45。',
+  },
+  {
+    key: 'pacing.reply.quiet.minSleepHours', group: '主动接话', type: 'float', label: '最短睡多久', unit: '小时',
+    min: 2, max: 8, step: 0.5, default: 5.5,
+    hint: '再累也不会少于这么久（下限，防止窗口太窄）。',
+  },
+  {
+    key: 'pacing.reply.quiet.maxSleepHours', group: '主动接话', type: 'float', label: '最长睡多久', unit: '小时',
+    min: 5, max: 16, step: 0.5, default: 9.5,
+    hint: '再困也不会超过这么久（上限）。',
+  },
+  {
+    key: 'pacing.reply.quiet.allNighterPct', group: '主动接话', type: 'int', label: '通宵概率', unit: '%',
+    min: 0, max: 30, step: 1, default: 4,
+    hint: '每天有多大概率整夜不睡（像人一不小心过上美国人作息）；通宵那天没有免打扰窗口，第二天会"补觉式早睡"。',
+  },
+  {
+    key: 'pacing.reply.quiet.bedtimeGraceMin', group: '主动接话', type: 'int', label: '睡前临界点', unit: '分钟',
+    min: 0, max: 120, step: 5, default: 30,
+    hint: '睡点前这段时间她还醒着：被叫会回，但会带困意/说要睡了这种正常反应。0 = 不设临界点。',
+  },
+  {
+    key: 'pacing.reply.continuation.enabled', group: '连续对话', type: 'bool',
+    label: '回完话隔一会儿再补一句', default: false,
+    hint: '开：别人叫过她、她也回过话之后，等一会儿把这段时间的新消息再判一次——想补一句就补，不想就不发。'
+      + '比「主动接话」更自然（像是话说到一半想起来）。默认关。',
+  },
+  {
+    key: 'pacing.reply.continuation.delayMs', group: '连续对话', type: 'int',
+    label: '回完话等多久再检查', unit: '秒', scale: 1000, min: 10, max: 1800, step: 10,
+    default: 120000,   // 存的是毫秒（面板值 = 存储 / scale），别写成 120
+    hint: '默认 120 秒。太短像是在抢话，太长话题已经过去了。',
+  },
+  {
+    key: 'pacing.reply.continuation.bonus', group: '连续对话', type: 'float',
+    label: '续聊倾向', unit: '', scale: 1, min: 0, max: 5, step: 0.1, default: 1.5,
+    hint: '直接加到「要不要接」的分数上：越大越爱补一句；1.5 表示比普通主动接话更倾向于说。',
+  },
+  {
+    key: 'pacing.reply.continuation.quoteLastHuman', group: '连续对话', type: 'bool',
+    label: '补的话引用最后一条消息', default: false,
+    hint: '开：续聊时挂一个引用，看起来像在接那个人的话；关（默认）：不引用，更像随口插一句。',
   },
   {
     key: 'pacing.reply.repeatEnabled', group: '主动接话', type: 'bool', label: '复读机（跟着刷屏）',
@@ -342,6 +484,10 @@ export const CORE_CONTROLS = [
 
 /** @typedef {{id:string,group:string,label:string,hint?:string,confirm?:{title?:string,okLabel?:string},hidden?:boolean}} ActionDef */
 export const ACTIONS = [
+  {
+    id: 'dream-run', group: '梦境', label: '🌙 现在做一次梦',
+    hint: '立刻让她做一次梦（不等今晚的自动时刻）。会调用一次模型；做完可在「梦境」页看结果。',
+  },
   {
     id: 'selfcheck', group: '运维', label: '跑离线自检',
     hint: '调用本机 ops 提供的离线自检（不碰 QQ）；未配置运维能力时点了会提示“本机未配置”。',

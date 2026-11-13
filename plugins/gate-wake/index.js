@@ -368,10 +368,32 @@ async function handlePoke(bot, ev, notice) {
  */
 async function tryRecall(bot, ev) {
   if (!ev.replyToId) return false
-  // 只认「整条消息就是一句撤回指令」——「聊到撤回」这类闲聊里出现关键词绝不能当命令
+  // ── 闸 ①：正文必须**整条就是一句「撤回」**，且动词只认「撤回」 ──────────────
+  // 为什么收紧到只认「撤回」：「撤销 / 回收 / 删除 / 撤掉」在技术讨论里太常见，
+  // 上游 2026-11-09 就是被这组词咬过（群友正文写「撤销工具」→ 撤错了别人那句）。
+  // 我们更严一层：要求整条消息就是命令，闲聊里出现关键词一律不算。
   const bare = String(ev.text || '').trim().replace(/[\s\p{P}\p{S}]/gu, '')
   if (!bare || bare.length > 8) return false
-  if (!/^(?:把)?(?:这(?:条|个)?|它)?(?:撤回|撤掉|撤销|回收|撤了)(?:吧|啊|呀|下|一下)?$/.test(bare)) return false
+  // 语序两种都认：中文最自然的说法是「撤回这条」（动词在前），也有人写「这条撤回」。
+  // 以前只允许后者 → 最常见的说法撤不掉（WAKE-RECALL 测试一直失败就是它）。
+  if (!/^(?:把)?(?:这(?:条|个)|它)?(?:撤回|撤了)(?:这(?:条|个)|它)?(?:吧|啊|呀|下|一下)?$/.test(bare)) return false
+
+  // ── 闸 ②：被引那条**必须是本机自己发的** ────────────────────────────────
+  // 不加这道闸的话：谁引用别人的消息说一句「撤回」，我们就会把**别人**的消息删掉（= 越权、像在滥用）。
+  // 反查不到（超时/已删除/协议端不支持）→ 当"不是本机"，静默跳过，交给正常对话流程。
+  const selfId = Number(bot.napcat?.selfId) || 0
+  let quoted = null
+  try {
+    if (typeof bot.napcat?.msgById === 'function') quoted = await bot.napcat.msgById(ev.replyToId)
+  } catch (e) {
+    bot.log.debug(`撤回前反查被引消息失败（当不是本机处理）: ${e.message}`)
+  }
+  const quotedSender = Number(quoted?.sender?.user_id ?? quoted?.user_id ?? 0)
+  if (!selfId || !quoted || quotedSender !== selfId) {
+    bot.log.debug(`[撤回] 被引消息不是本机发的（quoted=${quotedSender || '?'} self=${selfId || '?'}）→ 不撤，按正常对话走`)
+    return false
+  }
+
   const scratch = scratchOf(bot, ev.chatKey)
   const tried = (scratch.recallTried ||= new Set())
   const key = String(ev.replyToId)

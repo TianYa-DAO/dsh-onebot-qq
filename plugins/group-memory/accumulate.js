@@ -29,12 +29,16 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
+import { createHash } from 'node:crypto'
+import { senderNameOf } from '../../kernel/format.js'
 import { readJsonFile, writeJsonFileSync, atomicWriteFileSync } from '../../platform/atomic.js'
 import { ensureDir } from '../../platform/paths.js'
 
 /** 单轮默认最多处理多少个群（配置项 accumulateMaxGroupsPerRound 可覆盖；配合轮转游标保证公平）。 */
 const DEFAULT_MAX_GROUPS_PER_ROUND = 12
 /** 历史版本子目录（与旧版布局一致）。 */
+import { createDailyAccumulator } from './daily.js'
+
 const REVISIONS = '.revisions'
 /** 批量输出漏群时，最多再逐群兜底几次（防止又变成“每群一次调用”）。 */
 const MAX_BATCH_FALLBACK = 3
@@ -54,7 +58,21 @@ const MAX_BATCH_FALLBACK = 3
  * @param {() => number} [deps.maxBytesOf]                        单篇读取上限（写盘预算用）
  * @returns {{status:Function, trigger:Function, manual:Function, sync:Function, start:Function, stop:Function, submit:Function}}
  */
-export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, memoryDirOf, readMemoryOf, invalidateMemoryOf, maxBytesOf }) {
+export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, memoryDirOf, readMemoryOf, invalidateMemoryOf, maxBytesOf, mutedOf }) {
+  // ── 每日互动记忆（摘自上游戏 2026-11-10）────────────────────────────────
+  // 逐会话、每天一次、结构化增删改（稳定/近期/约定三区），比"整篇重写"更不容易漂移。
+  // 和旧间隔模式共用同一套外部 API（status/trigger/start/stop…），所以上层无需感知。
+  // cfg.accumulateSchedule === 'interval' 时才走下面的旧实现。
+  if (cfg.accumulateSchedule !== 'interval') {
+    return createDailyAccumulator({
+      bot, cfg, log,
+      dataDirOf, memoryDirOf,
+      readMemoryOf,
+      invalidateMemoryOf,
+      maxBytesOf: () => maxBytesOf?.(),
+      mutedOf: (key) => Boolean(mutedOf?.(key)),
+    })
+  }
   const maxBytesOfSafe = () => Math.max(1000, Number(maxBytesOf?.()) || 24000)
   const num = (v, d, min, max) => {
     const n = Number(v)
@@ -67,6 +85,16 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
   const msgPerGroup = () => Math.round(num(cfg.accumulateMsgPerGroup, 200, 20, 1000))
   const maxCharsOf = () => Math.round(num(cfg.accumulateMaxChars, 8000, 1000, 30000))
   const minNewMsgs = () => Math.round(num(cfg.accumulateMinNewMsgs, 20, 0, 500))
+  /** 会话级沉淀：群安静多少分钟后，就把这轮聊的内容立刻提炼掉（0 = 关，退回只按固定间隔）。
+   *  为什么需要：固定 8 小时一轮，中间那 8 小时的细节最容易漏；聊完就该收一次。
+   *  为什么等"安静"而不是每条都沉淀：聊天中途沉淀看到的是半截对话，提炼出来是错的。 */
+  const idleMinOf = () => Math.round(num(cfg.accumulateIdleMin, 30, 0, 720))
+  /** 同一个群两次「聊完沉淀」之间至少隔这么久，避免反复触发模型调用。 */
+  const IDLE_COOLDOWN_MS = 10 * 60 * 1000
+  /** 会话级沉淀的门槛：至少要有几条**别人**的消息（她自己的自言自语不算）。
+   *  为什么单独设：固定间隔那轮用 minNewMsgs(默认 20)，而"聊完收一次"往往只有几条，
+   *  但又不能因为她自己在死群里说了几句就触发 —— 那会出现「接话→沉淀→再接话→再沉淀」的空转。 */
+  const idleMinMsgsOf = () => Math.round(num(cfg.accumulateIdleMinMsgs, 3, 1, 100))
   const retainRevisions = () => Math.round(num(cfg.accumulateRetainRevisions, 20, 0, 200))
   const accumulateMode = () => {
     const m = String(cfg.accumulateMode || 'digest')
@@ -104,10 +132,24 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
    * 两者差一轮模型调用的时长：用 Date.now() 会把积累期间新到的消息一起标成已消化（旧版会丢这些消息）。
    */
   const digestedAtOf = (gid) => Number(state.groups?.[gid]?.digestedAt) || 0
-  function markDigested(gid, ts) {
+  // ID 不跨方向复用；无 ID 的旧留档用内容指纹，轮转/裁剪后仍稳定。
+  const messageKey = (row) => createHash('sha256').update(JSON.stringify(
+    row.messageId != null
+      ? [row.dir, String(row.messageId), row.ts]
+      : [row.dir, row.ts, row.sender, row.text],
+  )).digest('hex')
+  function isDigested(gid, row, seen) {
+    const group = state.groups[gid] || {}
+    if (Array.isArray(group.seenMessages)) {
+      return Number(row.ts) < (Number(group.legacyDigestedBefore) || 0) || (seen || new Set(group.seenMessages.map(([key]) => key))).has(messageKey(row))
+    }
+    return Number(row.ts) < digestedAtOf(gid) // 旧水位边界重放一次，不回灌更早历史
+  }
+  function markDigested(gid, ts, checkpoint) {
     const at = Number(ts)
     if (!(at > 0)) return false // 没喂到任何消息 → 不推水位（下轮重试）
-    state.groups[gid] = { ...(state.groups[gid] || {}), digestedAt: at, at: Date.now() }
+    const old = state.groups[gid] || {}
+    state.groups[gid] = { ...old, ...checkpoint, digestedAt: Math.max(digestedAtOf(gid), at), at: Date.now() }
     return true
   }
 
@@ -124,7 +166,6 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
     return { selected: rotated.slice(0, cap), deferred: Math.max(0, rotated.length - cap), total: all.length }
   }
 
-  /** 群号清单：聊天留档里出现过的群 ∪ 已有记忆文件的群。 */
   /** 该群是否被排除（她在群设置里勾了"不积累记忆"）。
    *  cfg 是传入的配置对象引用（内核热改是就地改这个对象），所以直接读字段，不要当函数调。 */
   function skippedGroup(gid) {
@@ -132,6 +173,7 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
     return list.includes(String(gid))
   }
 
+  /** 群号清单：聊天留档里出现过的群 ∪ 已有记忆文件的群。 */
   function listGroupIds() {
     const ids = new Set()
     let names = []
@@ -151,7 +193,8 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
 
   /**
    * 读某群「上次消化之后」的聊天留档（jsonl，含轮转文件），按时间升序。
-   * 水位是**包含式**的（ts <= digestedAt 视为已处理），避免把边界那条无限重喂。
+   * 在既有 lookback 窗口内重叠读取，以稳定消息键去重，接住同秒/乱序迟到消息。
+   * 旧版纯 ts 水位只重放边界一次；更早的旧历史保持已处理语义。
    * @returns {{rows:Array, total:number, newestTs:number}} rows = 最近 msgPerGroup 条窗口（更早的计入 total）
    */
   function readRecentMessages(gid) {
@@ -165,7 +208,11 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
         .map((x) => x.n)
     } catch { return { rows: [], total: 0, newestTs: 0 } }
     // 只取「上次消化之后」的新消息；从没消化过就取最近 lookback 窗口
-    const since = digestedAtOf(gid) || (Date.now() - lookbackMs())
+    const group = state.groups[gid] || {}
+    const since = Array.isArray(group.seenMessages)
+      ? Math.max(Number(group.replayFrom) || 0, Date.now() - lookbackMs())
+      : (digestedAtOf(gid) || (Date.now() - lookbackMs()))
+    const seen = new Map(Array.isArray(group.seenMessages) ? group.seenMessages : [])
     const out = []
     for (const n of names) {
       let text = ''
@@ -175,20 +222,30 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
         if (!s) continue
         let row
         try { row = JSON.parse(s) } catch { continue }
+        if (!row || typeof row !== 'object') continue
         const ts = Number(row?.ts) || 0
-        if (ts && ts <= since) continue
+        if (ts && ts < since) continue
+        const key = messageKey(row)
+        if (seen.has(key)) continue
+        seen.set(key, ts)
         const msg = String(row?.text ?? '').replace(/\s+/g, ' ').trim()
         if (!msg) continue
         if (/^\[CQ:[^\]]+\]$/.test(msg)) continue // 纯图片/表情占位不喂给模型
         const outbound = row?.dir === 'out'
-        const nick = String(row?.sender?.nickname || row?.sender?.card || '').trim()
+        const nick = String(senderNameOf(row.sender) || '').trim()
         const qq = String(row?.sender?.qq ?? '').trim()
-        out.push({ ts, out: outbound, who: outbound ? '机器人' : (nick && qq ? `${nick}(${qq})` : (nick || qq || '未知')), text: msg })
+        out.push({ ts, out: outbound, who: outbound ? '机器人' : (nick && qq && nick !== qq ? `${nick}(${qq})` : (nick || qq || '未知')), text: msg })
       }
     }
     out.sort((a, b) => a.ts - b.ts)
     const newestTs = out.length ? out[out.length - 1].ts : 0
-    return { rows: out.slice(-msgPerGroup()), total: out.length, newestTs }
+    // 去重状态只保留回看窗口；不能按条数截断同秒边界，否则迟到消息会再次漏掉。
+    const checkpoint = {
+      replayFrom: since,
+      legacyDigestedBefore: Number(group.legacyDigestedBefore) || (!Array.isArray(group.seenMessages) ? digestedAtOf(gid) : 0),
+      seenMessages: [...seen].filter(([, ts]) => ts >= since),
+    }
+    return { rows: out.slice(-msgPerGroup()), total: out.length, newestTs, checkpoint }
   }
 
   /**
@@ -570,6 +627,7 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
       if (!m || !groups.has(m[1])) continue
       const gid = m[1]
       const digestedAt = digestedAtOf(gid)
+      const seen = new Set((state.groups[gid]?.seenMessages || []).map(([key]) => key))
       const file = path.join(dir, n)
       let text = ''
       try { text = fs.readFileSync(file, 'utf8') } catch { continue }
@@ -577,19 +635,20 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
       let removed = 0
       for (const line of text.split('\n')) {
         if (!line.trim()) continue
-        let ts = 0
-        try { ts = Number(JSON.parse(line)?.ts) || 0 } catch { ts = 0 }
+        let row
+        try { row = JSON.parse(line) || {} } catch { row = {} }
+        const ts = Number(row?.ts) || 0
         const expired = cutoff > 0 && ts > 0 && ts < cutoff
-        const digested = digestedAt > 0 && ts <= digestedAt
+        const digested = digestedAt > 0 && isDigested(gid, row, seen)
         if (expired && digested) { removed += 1; continue }
-        rows.push({ line, ts })
+        rows.push({ line, ts, digested })
       }
       if (keepRows > 0 && rows.length > keepRows) {
         const overflow = rows.length - keepRows
         let dropped = 0
         const kept = []
         for (const r of rows) {
-          if (dropped < overflow && digestedAt > 0 && r.ts <= digestedAt) { dropped += 1; removed += 1; continue }
+          if (dropped < overflow && r.digested) { dropped += 1; removed += 1; continue }
           kept.push(r)
         }
         rows.length = 0
@@ -822,7 +881,7 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
       throw new Error('points 里没有解析到任何 Markdown 列表行；请按 `- **昵称(QQ)**：…` / `- 风格：…` / `- 其它：…` 重新提交，没有新增写「（无新增）」')
     }
     const fedTs = b.lastFedTs?.get?.(gid) || 0
-    markDigested(gid, fedTs)
+    markDigested(gid, fedTs, b.checkpoints.get(gid))
     b.applied.add(gid)
     b.result.sampledOut = (b.result.sampledOut || 0) + (b.sampled?.get?.(gid) || 0)
     recordGroup(b.result, gid, (m.added || m.updated || m.dropped) ? 'updated' : 'skipped')
@@ -876,7 +935,7 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
       if (!parsed.size) return { gid, status: 'failed', detail: '模型输出为空或格式不符', sampled }
       const m = mergeDigest(gid, parsed.get(gid))
       if (!m.parsed && !m.none) return { gid, status: 'failed', detail: '模型提交的内容没有可解析的列表行，未写盘（不推水位）', sampled }
-      markDigested(gid, lastFedTs)
+      markDigested(gid, lastFedTs, item0.checkpoint)
       return {
         gid,
         status: (m.added || m.updated || m.dropped) ? 'updated' : 'skipped',
@@ -887,7 +946,7 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
       }
     }
     const r = applyModelText(gid, res?.text)
-    if (r.status !== 'failed') markDigested(gid, lastFedTs)
+    if (r.status !== 'failed') markDigested(gid, lastFedTs, item0.checkpoint)
     return { ...r, sampled }
   }
 
@@ -909,14 +968,14 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
       const sampled = Math.max(0, Number(d.total || d.rows.length) - tr.included.length)
       const size = (old?.text || '').length + tr.text.length + 400
       if (cur.length && curLen + size > batchMaxCharsOf()) { chunks.push(cur); cur = []; curLen = 0 }
-      cur.push({ gid: d.gid, rows: d.rows, oldText: old?.text || '', transcript: tr.text, lastFedTs, sampled })
+      cur.push({ gid: d.gid, rows: d.rows, oldText: old?.text || '', transcript: tr.text, lastFedTs, sampled, checkpoint: d.checkpoint })
       curLen += size
     }
     if (cur.length) chunks.push(cur)
 
     for (const chunk of chunks) {
       const items = chunk.map((it) => ({
-        gid: it.gid, oldText: it.oldText, transcript: it.transcript, lastFedTs: it.lastFedTs, sampled: it.sampled,
+        gid: it.gid, oldText: it.oldText, transcript: it.transcript, lastFedTs: it.lastFedTs, sampled: it.sampled, checkpoint: it.checkpoint,
       }))
       const mode = accumulateMode() === 'rewrite' ? 'rewrite' : 'digest'
       const gids = new Set(items.map((it) => it.gid))
@@ -929,6 +988,7 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
           gids,
           result,
           applied: viaTool,
+          checkpoints: new Map(items.map((it) => [it.gid, it.checkpoint])),
           lastFedTs: new Map(items.map((it) => [it.gid, it.lastFedTs])),
           sampled: new Map(items.map((it) => [it.gid, it.sampled])),
         }
@@ -974,7 +1034,7 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
                 result.failed.push({ gid: it.gid, detail: '正文里没有可解析的列表行，未写盘（不推水位）' })
                 continue
               }
-              markDigested(it.gid, it.lastFedTs)
+              markDigested(it.gid, it.lastFedTs, it.checkpoint)
               result.sampledOut = (result.sampledOut || 0) + (it.sampled || 0)
               recordGroup(result, it.gid, (m.added || m.updated || m.dropped) ? 'updated' : 'skipped')
               result.digest.push({ gid: it.gid, ...m, via: 'text' })
@@ -1001,7 +1061,7 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
         try {
           const r = applyModelText(it.gid, text)
           if (r.status !== 'failed') {
-            markDigested(it.gid, it.lastFedTs)
+            markDigested(it.gid, it.lastFedTs, it.checkpoint)
             result.sampledOut = (result.sampledOut || 0) + (it.sampled || 0)
             if (r.status === 'updated') result.updated.push(it.gid)
             else result.skipped.push(it.gid)
@@ -1031,11 +1091,12 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
   }
 
   /** 跑一轮：先筛“有新消息”的群，再按积累方式批量或逐群处理，最后车轮清理旧记录。 */
-  async function runRound({ trigger = 'schedule' } = {}) {
+  async function runRound({ trigger = 'schedule', only = null } = {}) {
     const started = Date.now()
     callsInRound = 0
     const picked = pickGroups()
-    const ids = picked.selected
+    // only：会话级沉淀只处理"刚好聊完"的那几个群，不动轮转游标之外的群
+    const ids = Array.isArray(only) && only.length ? only.map(String) : picked.selected
     const result = {
       ok: true, trigger,
       groups: ids.length, deferred: picked.deferred, sampledOut: 0,
@@ -1045,11 +1106,15 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
     for (const gid of ids) {
       if (!accumulateOn() && trigger === 'schedule') break // 跑的过程中被关掉：立即停
       const rd = readRecentMessages(gid)
-      if (rd.rows.length < minNewMsgs()) {
+      // idle（聊完收一次）用"别人的消息 ≥ idleMinMsgs"当门槛；固定间隔那轮仍用 minNewMsgs。
+      const humanCount = (rd.rows || []).filter((r) => !r.out).length
+      const minNeeded = trigger === 'idle' ? idleMinMsgsOf() : minNewMsgs()
+      const tooFew = trigger === 'idle' ? humanCount < minNeeded : rd.rows.length < minNeeded
+      if (tooFew) {
         result.skipped.push(gid)
         continue
       }
-      due.push({ gid, rows: rd.rows, total: rd.total, newestTs: rd.newestTs })
+      due.push({ gid, rows: rd.rows, total: rd.total, newestTs: rd.newestTs, checkpoint: rd.checkpoint })
     }
     if (due.length) {
       if (accumulateMode() === 'per-group') {
@@ -1070,7 +1135,9 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
       }
     }
     // 群很多时本轮只处理前 N 个：记下轮转游标，下一轮从下一个群开始（否则大号段群永远饿死）
-    if (ids.length) cursor = ids[ids.length - 1]
+    // 只有"全量轮转"那轮才推进游标；会话级沉淀（only=[某群]）不能动游标，
+    // 否则固定间隔那轮的公平分批会被打乱（某些群长期轮不到）。
+    if (ids.length && !(Array.isArray(only) && only.length)) cursor = ids[ids.length - 1]
     // 车轮清理：只删「已消化 且 超过保留窗口」的原始记录
     try { result.pruned = pruneArchive() } catch (e) { log.warn(`[群记忆] 旧记录清理失败: ${e.message}`) }
     try { result.prunedRevisions = pruneAllRevisions() } catch (e) { log.warn(`[群记忆] 旧版本清理失败: ${e.message}`) }
@@ -1087,11 +1154,11 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
   }
 
   /** 统一触发入口（定时器 + 控制台「立刻积累」都走这里）：单飞，返回同一个 Promise。 */
-  function trigger({ trigger: kind = 'manual' } = {}) {
+  function trigger({ trigger: kind = 'manual', only = null } = {}) {
     if (running) return { started: false, busy: true, promise: running, message: lastResult?.message || '上一轮还在跑' }
     const p = (async () => {
       try {
-        const r = await runRound({ trigger: kind })
+        const r = await runRound({ trigger: kind, only })
         lastRunAt = Date.now()
         lastError = ''
         saveState()
@@ -1111,6 +1178,51 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
     return { started: true, busy: false, promise: p, message: '已在后台开始积累（过一会儿刷新看结果）' }
   }
 
+  /**
+   * 会话级沉淀：找出「刚聊完」的群。
+   * 判据：① 攒够了 minNewMsgs 条新消息（不够不值得花一次模型调用）
+   *      ② 最后一条消息已经是 idleMinOf() 分钟前（说明这一轮聊完了，中途沉淀会提炼出半截对话）
+   *      ③ 这个群 10 分钟内没被闲置沉淀过（防反复触发）
+   * 每轮最多取 MAX_IDLE_PER_TICK 个群，避免一次卡太久。
+   */
+  const idleDigestedAt = new Map()   // gid → 上次闲置沉淀完成的时间
+  const MAX_IDLE_PER_TICK = 3
+  function idleCandidates() {
+    const idleMs = idleMinOf() * 60000
+    if (!idleMs) return []
+    const now = Date.now()
+    const out = []
+    for (const gid of listGroupIds()) {
+      if (out.length >= MAX_IDLE_PER_TICK) break
+      const rd = readRecentMessages(gid)
+      // ⚠️ 只数**别人**说的话：
+      //   她在死群里主动接话后没人应，那几句是她自己说的，不该当成"这一轮聊完了"的素材；
+      //   否则会形成 接话 → 30 分钟后沉淀 → 再接话 → 再沉淀 的空转（记忆被灌成她的自言自语）。
+      const fromOthers = (rd.rows || []).filter((r) => !r.out)
+      if (fromOthers.length < idleMinMsgsOf()) continue
+      // 最后一条是她说的 → 说明"她刚自言自语完没人接"，没有新信息可沉淀
+      const last = (rd.rows || [])[rd.rows.length - 1]
+      if (last && last.out) continue
+      const newestHumanTs = fromOthers.reduce((m, r) => Math.max(m, Number(r.ts) || 0), 0)
+      if (!newestHumanTs || now - newestHumanTs < idleMs) continue    // 别人还在聊，别打断
+      if (now - (idleDigestedAt.get(gid) || 0) < IDLE_COOLDOWN_MS) continue
+      out.push({ gid, pending: fromOthers.length, idleMin: Math.round((now - newestHumanTs) / 60000) })
+    }
+    return out
+  }
+
+  /** 定时器每 60 秒调一次：有"刚聊完"的群就单独沉淀它们（不影响固定间隔那轮）。 */
+  function tickIdle() {
+    if (!accumulateOn()) return null
+    if (running) return null
+    const cands = idleCandidates()
+    if (!cands.length) return null
+    const gids = cands.map((c) => c.gid)
+    for (const g of gids) idleDigestedAt.set(g, Date.now())
+    log.info(`[群记忆] 会话级沉淀：${gids.join(', ')}（${cands.map((c) => `闲置 ${c.idleMin} 分钟/待提炼 ${c.pending} 条`).join('；')}）`)
+    return trigger({ trigger: 'idle', only: gids })
+  }
+
   function nextDueAt() {
     if (!accumulateOn()) return 0
     return lastRunAt ? lastRunAt + intervalMs() : bootAt + 5 * 60 * 1000
@@ -1127,6 +1239,7 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
       lookbackHours: Math.round(lookbackMs() / 3600000),
       msgPerGroup: msgPerGroup(),
       minNewMsgs: minNewMsgs(),
+      idleMinutes: idleMinOf(),
       retainRevisions: retainRevisions(),
       maxGroupsPerRound: maxGroupsOf(),
       sampledOut: Number(lastResult?.sampledOut) || 0,
@@ -1146,8 +1259,9 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
         if (!accumulateOn()) return
         if (running) return
         const due = nextDueAt()
-        if (due && Date.now() < due) return
-        trigger({ trigger: 'schedule' })
+        if (due && Date.now() >= due) { trigger({ trigger: 'schedule' }); return }
+        // 还没到固定间隔：看看有没有"刚聊完"的群，单独沉淀它们
+        tickIdle()
       } catch (e) { log.warn(`[群记忆] 定时检查异常: ${e.message}`) }
     }, 60 * 1000)
     timer.unref?.()
@@ -1177,5 +1291,5 @@ export function createAccumulator({ bot, cfg = {}, log = console, dataDirOf, mem
     return true
   }
 
-  return { status, trigger, manual, sync, submit, start, stop }
+  return { status, trigger, manual, sync, submit, start, stop, tickIdle }
 }

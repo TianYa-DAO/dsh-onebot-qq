@@ -27,12 +27,57 @@ import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 
-import { extractText, clipChars } from './format.js'
+import { extractText, clipChars, renderForward } from './format.js'
 import { readJsonFile, writeJsonFileSync } from '../platform/atomic.js'
 import { normForCompare } from '../platform/paths.js'
 
 /** 群上文最多往回看 30 分钟 —— 更老的对话塞进 prompt 只会干扰当前话题。 */
 const GROUP_CONTEXT_MAX_AGE_MS = 30 * 60 * 1000
+
+/**
+ * 合并转发的正文缓存：同一条转发的内容是不可变的，同一个 id 不必反复打接口。
+ * 群上文每轮都会重读最近几条，没有缓存的话一次转发会被反复拉几十次。
+ */
+const FWD_CACHE = new Map() // id → { text, at }
+const FWD_CACHE_TTL_MS = 10 * 60 * 1000
+const FWD_CACHE_MAX = 200
+
+/**
+ * 把一条合并转发解析成可读文本（内联内容优先，其次打 get_forward_msg）。
+ * 为什么内联优先：真机上 NapCat 的 get_msg 常把转发内容直接内联在 data.content 里，
+ * 而 get_forward_msg(id) 对这类消息会失败（"消息已过期或者为内层消息"）。
+ * @returns {Promise<string>} 取不到返回 ''（调用方跳过，不塞占位垃圾）
+ */
+async function resolveForwardText(napcat, item, budgetChars) {
+  // ⚠️ 这是模块级函数，拿不到 createDshDriver 里的 log —— 早先在这里 log.debug
+  //    会把 ReferenceError 抛出去，外层 fetchGroupContext 的 catch 一吞，
+  //    **整段群上文都没了**（取不到一条转发 ≠ 丢掉全部上文）。所以这里绝不许抛。
+  try {
+    const inline = Array.isArray(item?.content) ? item.content : null
+    const id = String(item?.id || '')
+    if (!inline && id) {
+      const hit = FWD_CACHE.get(id)
+      if (hit && Date.now() - hit.at < FWD_CACHE_TTL_MS) return hit.text
+    }
+    const renderOpts = { maxItems: 20, perItemChars: 60, totalChars: Math.max(200, budgetChars) }
+    let text = ''
+    if (inline) {
+      text = renderForward({ content: inline }, renderOpts)
+    } else if (id) {
+      try {
+        const fwd = await napcat.getForwardMsg(id)
+        text = fwd ? renderForward(fwd, renderOpts) : ''
+      } catch { /* 过期/内层消息：当没取到，不阻塞下文 */ }
+    }
+    if (id && text) {
+      if (FWD_CACHE.size >= FWD_CACHE_MAX) FWD_CACHE.delete(FWD_CACHE.keys().next().value)
+      FWD_CACHE.set(id, { text, at: Date.now() })
+    }
+    return text
+  } catch {
+    return ''
+  }
+}
 
 /** 会话标题同步的节流窗口：触发点是"每条要处理的消息"，群里刷屏时不该反复查群名/改标题。 */
 const TITLE_SYNC_THROTTLE_MS = 60 * 1000
@@ -374,9 +419,21 @@ export function createDshDriver(opts) {
    * @param {object} ev  BotMessageEvent（用 chatKey / groupId / messageId）
    * @param {number} count 最多给几条
    */
-  async function fetchGroupContext(ev, count) {
+  /**
+   * 拉群上文。
+   * @param {object} ev 事件（要 groupId / chatKey / messageId）
+   * @param {number} count 最多几条
+   * @param {{maxAgeMs?:number, withTime?:boolean}} [opts]
+   *   maxAgeMs：多老的消息还算"上文"（默认 30 分钟）。
+   *     ⚠️ 冷场找话必须放宽：冷场阈值本身常常 >30 分钟，用 30 分钟过滤会让上文**必然为空**
+   *     → 她只能说"群里没人说话"，永远接不上刚才的话题（2026-11-07 线上事故）。
+   *   withTime：每行前面标上"(X分钟前)"，让模型知道这是多久前的对话（老上文尤其需要）。
+   */
+  async function fetchGroupContext(ev, count, opts2 = {}) {
     const napcat = napcatOf()
     if (!ev?.groupId || !napcat || !(count > 0)) return ''
+    const maxAgeMs = Number(opts2?.maxAgeMs) > 0 ? Number(opts2.maxAgeMs) : GROUP_CONTEXT_MAX_AGE_MS
+    const withTime = opts2?.withTime === true
     try {
       const list = await napcat.groupHistory(ev.groupId, count + 2)
       if (!Array.isArray(list) || !list.length) return ''
@@ -388,12 +445,16 @@ export function createDshDriver(opts) {
       }
       const now = Date.now()
       const selfId = napcat.selfId
-      const lines = []
+      // rows：一条消息一组行（首行是 `[昵称(QQ:号)]: 正文`，后面跟着它转发出来的正文行）。
+      // 为什么分组：以前是平的 lines + 最后 slice(-count)，
+      // 一条转发带 5 行正文就会把别的消息挤出窗口（甚至把自己截断）。
+      const rows = []
       const images = []   // ⚠️ extractText 其实给了 images，早先直接丢掉了 → 上文只剩「[图片]」
       for (const m of list.slice(start)) {
         const mid = String(m.message_id)
         if (mid === String(ev.messageId)) continue                        // 本条正文已在 prompt 里
-        if (now - Number(m.time) * 1000 > GROUP_CONTEXT_MAX_AGE_MS) continue
+        const ageMs = now - Number(m.time) * 1000
+        if (ageMs > maxAgeMs) continue
         const who = m.sender?.card || m.sender?.nickname || String(m.sender?.user_id ?? '')
         const uid = m.sender?.user_id ?? ''
         // 行格式与"当前消息"的前缀统一成 `[昵称(QQ:号)]: 内容`：不带号时同名/近名的人会串。
@@ -401,7 +462,34 @@ export function createDshDriver(opts) {
         const raw = m.message ?? m.raw_message
         const parsed = extractText(raw, selfId)
         const txt = clipChars(parsed.text, 120).trim()
-        if (txt) lines.push(`[${who}(QQ:${uid})]: ${txt}`)
+        if (txt) {
+          // 超过 10 分钟的消息标上"多久之前"：冷场找话时会看到一两小时前的对话，
+          // 不给时间她就分不清"正在聊"还是"早聊完了"。
+          const ageMin = Math.round(ageMs / 60000)
+          const ago = (withTime && ageMin >= 10)
+            ? (ageMin >= 60 ? `(${Math.round(ageMin / 60)}小时前)` : `(${ageMin}分钟前)`)
+            : ''
+          const row = [`[${who}(QQ:${uid})]${ago}: ${txt}`]
+          // 合并转发：extractText 在纯函数里只能给占位符「[合并转发]」（不碰网络），
+          // 正文必须在这里取回来 —— 否则群里有人转了一份聊天记录，她只看到"有人发了个合并转发"。
+          // 线上反馈 2026-11-09：她说"看不了合并转发的聊天记录"。
+          if (parsed.forwards?.length) {
+            let budget = 900                       // 一次上文最多给转发正文这么多字
+            for (const fw of parsed.forwards.slice(0, 2)) {
+              if (budget <= 0) break
+              const body = await resolveForwardText(napcat, fw, budget)
+              if (!body) continue
+              for (const seg of body.split('\n')) {
+                if (budget <= 0) break
+                const one = clipChars(seg.trim(), Math.min(budget, 200))
+                if (!one) continue
+                row.push(`  ↳ ${one}`)
+                budget -= one.length
+              }
+            }
+          }
+          rows.push(row)
+        }
         // 收集这一条里的图片。**表情包也收**（她说"没收到表情包具体图片"就是这个）：
         // 表情包是群里的主要表达方式，只给「[表情]」文字她读不出情绪。
         // 用 isSticker 标出来，交给上层决定优先顺序（真图优先占用额度）。
@@ -413,8 +501,9 @@ export function createDshDriver(opts) {
       }
       // 水位推进到"本轮看到的最新一条"，而不是只记注入成功的：空文本/超龄消息下一轮不该重扫。
       if (state) state.lastContextId = list[list.length - 1]?.message_id ?? state.lastContextId
+      const kept = rows.slice(-count).flat()
       return {
-        block: lines.length ? `\n[群聊上文]\n${lines.slice(-count).join('\n')}` : '',
+        block: kept.length ? `\n[群聊上文]\n${kept.join('\n')}` : '',
         images,
       }
     } catch (e) {

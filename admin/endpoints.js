@@ -1186,6 +1186,13 @@ export function createAdminEndpoints({ kernel = {}, configPath = '', dataDir = '
     const id = toStr(payload.id)
     if (!id) throw new Error('action 需要 id')
     if (!ACTIONS.some((a) => a.id === id)) throw new Error(`未知动作：${id}`)
+    // 梦境：立刻做一次（梦境插件把能力挂在 kernel.shared 上）
+    if (id === 'dream-run') {
+      const run = kernel?.shared?.dreamRun
+      if (typeof run !== 'function') throw new Error('梦境插件未启用')
+      const r = await run({ force: true })
+      return { ok: Boolean(r?.ok), message: r?.ok ? `做完了：${String(r.content || '').slice(0, 40)}…` : `没做成（${r?.reason || '未知'}）`, detail: r }
+    }
 
     if (id === 'reply-preset') {
       const preset = toStr(payload.preset)

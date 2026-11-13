@@ -564,11 +564,13 @@ export function buildPromptText(ev, opts = {}) {
   const speaker = ev.isGroup && ev.wake?.kind !== 'proactive' && ev.wake?.kind !== 'welcome'
     ? `[${speakerTag}]: ` : ''
   const quote = opts.quoteText ? `\n\n[引用]\n${opts.quoteText}` : ''
+  // 合并转发：独立一段，紧跟正文（不要塞进 hint，模型会当成系统元数据忽略）
+  const forward = opts.forwardBlock ? `\n\n${opts.forwardBlock}` : ''
   const fileHint = opts.fileHint ? `\n${opts.fileHint}` : ''
   const cardHint = ev.cards?.length ? `\n[卡片] ${ev.cards.join(' ')}` : ''
   const imgHint = ev.imagePaths?.length ? `\n[图: ${ev.imagePaths.join(', ')}]` : ''
   const ctx = ev.historyBlock ? `\n${ev.historyBlock}` : ''
   const hints = ev.hint?.length ? `\n${ev.hint.join(' ')}` : ''
   // 双保险：拼好的 prompt 再兜一道合法化 —— 历史里只要带一个孤立代理，上游就整轮 400
-  return toWellFormedText(head + wakeMark + speaker + (ev.text || '') + fileHint + quote + cardHint + imgHint + ctx + hints + '\n[提醒:只写正文收不到]')
+  return toWellFormedText(head + wakeMark + speaker + (ev.text || '') + forward + fileHint + quote + cardHint + imgHint + ctx + hints + '\n[提醒:只写正文收不到]')
 }

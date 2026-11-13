@@ -33,9 +33,9 @@ test('空间工具已注册（看/发/删）', async (t) => {
   }
 })
 
-test('qzone_post 在群里被拒（说说公开可见，只认主人私聊）', async (t) => {
+test('qzone_post：关掉「允许她主动发」时，群里仍被拒（旧行为，兜底开关要有效）', async (t) => {
   const h = await bootKernel({
-    config: { pacing: { merge: { enabled: false } }, pluginConfig: { 'link-parser': { enabled: false }, qzone: { enabled: true, endpoint: QZD } } },
+    config: { pacing: { merge: { enabled: false } }, pluginConfig: { 'link-parser': { enabled: false }, qzone: { enabled: true, endpoint: QZD, allowSelfPost: false } } },
   })
   t.after(() => h.dispose())
   h.ctx.setPromptHandler(async () => {})

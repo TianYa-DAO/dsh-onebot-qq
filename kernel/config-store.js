@@ -54,6 +54,8 @@ export function defaultConfig() {
     },
     outbound: {
       replyMaxLength: 3000,
+      maxMessagesPerTurn: 6,           // 一轮最多发几条（保险丝，防压缩后重复回复刷屏）
+      maxPerWindow: 15,                // 5 分钟内同一会话最多发几条（跨轮兜底）
       longForwardThreshold: 400,
       longForwardChunkSize: 800,
       quoteAfterMsgs: 3,

@@ -295,8 +295,11 @@ export class NapCatAdapter {
     const maxRetry = opts.retries == null ? SEND_MAX_RETRY : Math.max(0, Number(opts.retries) || 0)
     let status
     let data = {}
+    const tSend = Date.now()
     try {
       ({ status, data } = await this._post(action, params, timeoutMs))
+      // 发送耗时埋点：用来区分"模型慢"还是"发消息慢"（QQ 服务器回执可能很慢）
+      this.log.info(`[发送耗时] ${action} ${chatKey} ${Date.now() - tSend}ms${attempt ? `（第 ${attempt + 1} 次）` : ''}`)
     } catch (e) {
       const reason = e.name === 'TimeoutError' ? `发送超时(${Math.round(timeoutMs / 1000)}s)` : `发送请求失败: ${e.message}`
       if (attempt < maxRetry) {
@@ -326,8 +329,10 @@ export class NapCatAdapter {
     const maxRetry = opts.retries == null ? SEND_MAX_RETRY : Math.max(0, Number(opts.retries) || 0)
     let status
     let data = {}
+    const tFwd = Date.now()
     try {
       ({ status, data } = await this._post(action, params, timeoutMs))
+      this.log.info(`[发送耗时] ${action} ${chatKey} ${Date.now() - tFwd}ms（合并转发）`)
     } catch (e) {
       const reason = e.name === 'TimeoutError' ? `转发卡片超时(${Math.round(timeoutMs / 1000)}s)` : `转发卡片请求失败: ${e.message}`
       if (attempt < maxRetry) {

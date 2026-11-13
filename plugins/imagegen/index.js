@@ -416,6 +416,104 @@ export default {
       return '1024x1024'
     }
 
+    // ── 入口 ⓪：图片清单工具 list_images（摘自上游戏 2026-10-26）──────────────────
+    // 为什么不再每轮往 prompt 里塞图库清单：ev.hint 会拼进**用户消息正文**，每轮都出现
+    // （库大时 300+ token），看着烦也白烧。改成按需查询：要画图/找图时自己调一次，平时 0 成本。
+    const REF_EXT_RE = /\.(png|jpe?g|webp|gif)$/i
+    const dataDirNow = () => String(bot.core?.dataDir || '.')
+    // 上传目录：本内核没有 bot.shared.uploadDir，退回 file-transfer 的配置 / 约定目录
+    const uploadDirNow = () => {
+      const ft = bot.core?.pluginConfig?.['file-transfer'] || {}
+      const own = String(ft.uploadDir || '').trim()
+      if (own) return path.isAbsolute(own) ? own : path.join(dataDirNow(), own)
+      return path.join(dataDirNow(), 'qq_uploads')
+    }
+    const IMG_SCOPES = {
+      refs: { label: '角色参考图', dir: () => refDirNow() },
+      avatars: { label: '头像缓存', dir: () => avatarDirNow() },
+      uploads: { label: 'QQ 发来的文件', dir: () => uploadDirNow() },
+      workspace: {
+        label: 'QQ 工作区',
+        dir: () => path.resolve(String(bot.core?.dsh?.qqWorkspacePath || '').trim() || path.join(dataDirNow(), 'workspace')),
+      },
+    }
+    const DEFAULT_SCOPES = ['refs', 'workspace', 'uploads', 'avatars']
+
+    /** 递归列某个根下的图片（深度 ≤3，跳过隐藏目录/node_modules；最多扫 800 个文件）。 */
+    const scanImages = (root, { limit, scanned = { n: 0 } }) => {
+      const out = []
+      const walk = (dir, depth) => {
+        if (out.length >= limit || scanned.n >= 800) return
+        let entries
+        try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch { return }
+        for (const ent of entries) {
+          if (out.length >= limit || scanned.n >= 800) return
+          const name = ent.name
+          if (name.startsWith('.') || name === 'node_modules') continue
+          const full = path.join(dir, name)
+          let st
+          try { st = fs.lstatSync(full) } catch { continue }
+          if (st.isSymbolicLink()) continue
+          if (st.isDirectory()) { if (depth < 3) walk(full, depth + 1); continue }
+          if (!st.isFile() || !REF_EXT_RE.test(name)) continue
+          scanned.n += 1
+          out.push({ path: full, name, bytes: st.size })
+        }
+      }
+      walk(root, 1)
+      return out
+    }
+
+    bot.registerTool('list_images', {
+      description:
+        '列出本机白名单目录里的图片文件（角色参考图、QQ 工作区、QQ 发来的文件、头像缓存）。'
+        + 'QQ 线**没有文件工具**，看不到本机目录 —— 想知道有哪些图可用、或用户提到某张图但你不知道文件名时，先调这个工具查。'
+        + '返回的 `path` 可以直接当 generate_image 的 image 参数（也支持只传文件名）。',
+      parameters: {
+        where: { type: 'string', description: '在哪个范围找：refs(角色参考图) / workspace(QQ 工作区) / uploads(QQ 发来的文件) / avatars(头像缓存) / all(全部，默认)' },
+        dir: { type: 'string', description: '可选：子目录（相对所选范围，如 `stroke_anim`），留空 = 该范围根目录' },
+        limit: { type: 'number', description: '最多返回几张（默认 30，最多 100）' },
+      },
+      execute: async (args = {}) => {
+        const where = String(args.where || '').trim().toLowerCase()
+        const limit = Math.max(1, Math.min(100, Math.floor(Number(args.limit) || 30)))
+        const scopes = where && where !== 'all' ? (IMG_SCOPES[where] ? [where] : null) : DEFAULT_SCOPES
+        if (!scopes) throw new Error(`where 只能是 ${['all', ...Object.keys(IMG_SCOPES)].join(' / ')}`)
+        const roots = scopes.map((k) => {
+          const base = IMG_SCOPES[k].dir()
+          const sub = String(args.dir || '').trim()
+          const target = sub ? path.resolve(base, sub) : path.resolve(base)
+          let realTarget = target
+          try { if (fs.existsSync(target)) realTarget = fs.realpathSync(target) } catch { /* 用原路径比 */ }
+          if (!isInsidePath(path.resolve(base), realTarget)) {
+            throw new Error(`dir 不能跳出「${IMG_SCOPES[k].label}」目录: ${sub}`)
+          }
+          return { key: k, label: IMG_SCOPES[k].label, dir: target }
+        })
+        const scanned = { n: 0 }
+        const items = []
+        for (const r of roots) {
+          if (items.length >= limit) break
+          for (const it of scanImages(r.dir, { limit: limit - items.length, scanned })) {
+            let px = null
+            try {
+              if (it.bytes <= 8 * 1024 * 1024) {
+                const p2 = imagePixelSize(fs.readFileSync(it.path))
+                if (p2) px = `${p2.w}x${p2.h}`
+              }
+            } catch { /* 读不到就不给尺寸，不影响列清单 */ }
+            items.push({ ...it, where: r.key, label: r.label, size: px })
+          }
+        }
+        const truncated = items.length >= limit
+        log.info(`[图片] list_images ${where || 'all'}${args.dir ? `/${args.dir}` : ''} → ${items.length} 张${truncated ? '（已截断）' : ''}`)
+        return {
+          ok: true, count: items.length, truncated, items,
+          note: truncated ? `只列了前 ${limit} 张，要更多就传更大的 limit 或指定 where/dir` : undefined,
+        }
+      },
+    })
+
     bot.registerTool('generate_image', {
       description:
         '按提示词生成或修改图片。不传 image = 文生图；传了 image = 图生图/改图，以那张图为参考，'

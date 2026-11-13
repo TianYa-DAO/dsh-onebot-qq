@@ -394,7 +394,7 @@ export async function apply(ctx, bundleConfig = {}) {
   })
   const state = new ChatState({ log })
   const pipeline = new Pipeline({ log })
-  const pacing = createPacing({ log: logFor('pacing'), state })
+  const pacing = createPacing({ log: logFor('pacing'), state, stateDir: path.join(dataDir, 'state') })
   pacing.apply(runtime.pacing)
   const archiveCfg = { ...runtime.archive }
   const archive = makeArchiver(archiveCfg, log)
@@ -487,10 +487,37 @@ export async function apply(ctx, bundleConfig = {}) {
     replyMaxLength: runtime.outbound?.replyMaxLength ?? 3000,
     outboundHooks,
     onAfterSend: (rec) => {
+      // 首句耗时：端到端（含合批等待）+ 模型段（不含等待）+ 本轮调过的工具
+      const tc = rec.turnCtx
+      // 每一次发送都记：本轮第几条、距上一条多久 → 直接看出"每步模型耗时"
+      if (tc) {
+        tc.replySent = (Number(tc.replySent) || 0) + 1
+        if (tc.replySent > 1) {
+          const sincePrev = Number(tc._lastSendAt) > 0 ? (Date.now() - Number(tc._lastSendAt)) / 1000 : null
+          log.info(`[步耗时] ${rec.target} 第 ${tc.replySent} 条：距上一条 ${sincePrev != null ? sincePrev.toFixed(1) : '?'}s`)
+        }
+        tc._lastSendAt = Date.now()
+      }
+      if (tc && !tc._firstSendLogged) {
+        tc._firstSendLogged = true
+        const now = Date.now()
+        const e2e = Number(tc._inboundAt) > 0 ? (now - Number(tc._inboundAt)) / 1000 : null
+        const f = (x) => (x != null ? Number(x).toFixed(1) : '?')
+        const queue = Number(tc._runAt) > 0 && Number(tc.startedAt) > 0 ? (Number(tc._runAt) - Number(tc.startedAt)) / 1000 : null
+        const ensure = Number(tc._ensureMs) >= 0 ? Number(tc._ensureMs) / 1000 : null
+        const promptMs = Number(tc._promptMs) >= 0 ? Number(tc._promptMs) / 1000 : null
+        const model = Number(tc._turnStartAt) > 0 ? (now - Number(tc._turnStartAt)) / 1000
+          : (Number(tc._runAt) > 0 ? (now - Number(tc._runAt)) / 1000 : null)
+        const tools = (tc._toolTrace || []).join('、') || '无'
+        log.info(`[耗时] ${rec.target} 首句 ${f(e2e)}s = 等合批/排队 ${f(queue)}s + DSH建会话 ${f(ensure)}s`
+          + ` + prompt提交 ${f(promptMs)}s + 模型到首句 ${f(model)}s | 工具：${tools}`)
+      }
       state.markSent(rec.target)
       pacing.noteOutbound(rec.target)
       // 主动接话的统计只认"这一轮真的发了"（普通回话不参合）
       if (rec.turnCtx?.wakeKind === 'proactive') pacing.markProactiveSent(rec.target)
+      // 连续对话：普通回话真的发出去了，才从这一刻开始算"隔多久再检查"
+      pacing.noteReplySent(rec.target, rec.turnCtx)
       archive(rec.target, { dir: 'out', ts: Date.now(), messageId: rec.messageId ?? null, text: rec.text, mode: rec.mode })
     },
   })
@@ -504,12 +531,16 @@ export async function apply(ctx, bundleConfig = {}) {
   //   · 一轮最多 2 条：拆条正好 2 条；模型想发第三条就报错，别刷屏
   deliver.onDecorate((out) => {
     const turnCtx = out.turnCtx ?? kernel.activeTurns.get(out.target) ?? null
-    if (!turnCtx || turnCtx.wakeKind !== 'proactive') return
-    if (out.ats?.length || out.replyTo != null) {
+    const kind0 = turnCtx?.wakeKind
+    // 主动接话 / 连续对话都是"它自己找的话"：默认不指人、不挂引用
+    if (!turnCtx || (kind0 !== 'proactive' && kind0 !== 'continuation')) return
+    // 例外：续聊开了「引用最后一条人类消息」时，只保留这一个引用目标（其余一律清掉）
+    const forceQuote = kind0 === 'continuation' ? (Number(turnCtx._forceReplyTo) || null) : null
+    if (out.ats?.length || (out.replyTo != null && Number(out.replyTo) !== forceQuote)) {
       log.info(`[主动接话] 丢掉 @/引用（${out.target}）：主动接话不指人、不挂引用`)
-      out.ats = []
-      out.replyTo = null
     }
+    out.ats = []
+    if (Number(out.replyTo) !== forceQuote) out.replyTo = forceQuote
     out.noForward = true
     turnCtx.proactiveMessages = (Number(turnCtx.proactiveMessages) || 0) + 1
     if (turnCtx.proactiveMessages > 2) {
@@ -523,14 +554,48 @@ export async function apply(ctx, bundleConfig = {}) {
     }
   })
 
+  // ── 内置出站钩子①·五：每轮发送条数硬上限（保险丝）──
+  //   病根：上下文压缩若发生在**轮中途**，模型会"忘记自己刚回过" → 继续发 → 再压缩 → 再发，
+  //   线上表现为连续十几分钟每条 20~40 秒地刷屏（2026-11-12 私聊事故）。
+  //   这条与压缩阈值修正互为兜底：就算再撞上压缩，也不会无限刷。
+  deliver.onDecorate((out) => {
+    if (!out || out.blocked) return
+    const turnCtx = out.turnCtx ?? kernel.activeTurns.get(out.target) ?? null
+    if (!turnCtx) return
+    // 0（或负数）= 不限条数（2026-11-13 主人要求解除昨天的保险丝）
+    const cap = Number(runtime.outbound?.maxMessagesPerTurn)
+    turnCtx.replyMessages = (Number(turnCtx.replyMessages) || 0) + 1
+    if (Number.isFinite(cap) && cap > 0 && turnCtx.replyMessages > cap) {
+      out.blocked = true
+      out.blockReason = `这一轮已经发了 ${cap} 条了（上限 ${cap}），别再发，直接结束本轮`
+      log.warn(`[出站] ${out.target} 本轮第 ${turnCtx.replyMessages} 条被拦（上限 ${cap}）—— 疑似压缩后重复回复`)
+      return
+    }
+    // 第二道保险丝：**按会话的滑动窗口**（跨轮次）。
+    // 每轮上限挡不住"很多个短轮各发几条"的风暴；这里用 5 分钟窗口兜底。
+    const winMs = 5 * 60 * 1000
+    const winCap = Number(runtime.outbound?.maxPerWindow)
+    if (!Number.isFinite(winCap) || winCap <= 0) return     // 0 = 不限（滑动窗口也关掉）
+    const slot = state.get(out.target)
+    const now = Date.now()
+    slot.outWin = (Array.isArray(slot.outWin) ? slot.outWin : []).filter((t) => now - Number(t) < winMs)
+    slot.outWin.push(now)
+    if (slot.outWin.length > winCap) {
+      slot.outWin.pop()
+      out.blocked = true
+      out.blockReason = `5 分钟内已经发了 ${winCap} 条了，先停一下`
+      log.warn(`[出站] ${out.target} 5 分钟内超过 ${winCap} 条 → 拦截（滑动窗口保险丝）`)
+    }
+  })
+
   // ── 内置出站钩子②：自动引用（锚在 turn/start → turn/end 之间有效，取队首＝正在回的那轮） ──
   deliver.onDecorate((out) => {
     // 只有模型经 send_message 发的回复才自动挂引用。命令 / 答应声 / 冷却 / 生图失败
     // 这些出站没有自己的回合上下文，以前回退 activeTurns 会把引用挂到上一个人身上。
     if (!out.autoQuote) return
     const turnCtx = out.turnCtx ?? null
-    // 主动接话不挂引用（上一道钩子已清掉显式值，这里也不再补）
-    if (!turnCtx || turnCtx.wakeKind === 'proactive') return
+    // 主动接话/续聊不挂引用（上一道钩子已清掉显式值，这里也不再补）
+    if (!turnCtx || turnCtx.wakeKind === 'proactive' || turnCtx.wakeKind === 'continuation') return
     if (out.noReply || out.replyTo != null || out.ats?.length) return
     const need = Number(runtime.outbound?.quoteAfterMsgs ?? 3)
     if (need <= 0) return
@@ -612,6 +677,11 @@ export async function apply(ctx, bundleConfig = {}) {
       target: { type: 'string', required: true, description: '会话目标，形如 group:123456 或 private:123456' },
       text: { type: 'string', required: true, description: '要发送的纯文本内容' },
       reply_to: { type: 'integer', description: '要引用回复的消息 ID（可选，传 0 明确不挂）' },
+      sticker: {
+        type: 'string',
+        description: '顺手带一张表情包：心情/关键词（「无语」「夸人」）或 `#12` 点名；'
+          + '只有提示里出现 [表情:…] 时才传，不传 = 不发',
+      },
     },
     async execute(args = {}) {
       const turnCtx = resolveCurrentTurn(args.target)
@@ -621,8 +691,52 @@ export async function apply(ctx, bundleConfig = {}) {
         // 只有模型显式调 send_message 的回复才由内核自动挂引用（锚已绑定当前 DSH 回合）
         autoQuote: true,
       })
-      return { ok: true, target: r.target, message_id: r.messageId, mode: r.mode, redacted: r.hits }
+      const out = { ok: true, target: r.target, message_id: r.messageId, mode: r.mode, redacted: r.hits }
+      // 表情包：正文发完后顺手带一张（插件通过 bot.shared.stickerSend 注册；没装/没开就如实说）
+      const wantSticker = String(args.sticker ?? '').trim()
+      if (wantSticker) {
+        const sendSticker = kernel.shared?.stickerSend
+        if (typeof sendSticker !== 'function') {
+          out.sticker = { ok: false, reason: '表情包插件未启用（sticker 参数被忽略）' }
+        } else {
+          try { out.sticker = await sendSticker({ target: r.target, query: wantSticker, turnCtx }) }
+          catch (e) { out.sticker = { ok: false, reason: e.message } }
+        }
+      }
+      return out
     },
+  })
+
+  // ── 兴趣画像：**她自己**决定喜欢什么话题、什么人（主动说话时会按这个挑）──
+  kernel.toolDefs.set('interest_note', {
+    pluginId: 'kernel',
+    description: '记下你自己对某个话题/某个人的兴趣和好感（会存在你自己的画像里，以后主动找人说话会优先按这个挑）。\n'
+      + '★ 这是你**自己的**判断，不是主人让你记的：觉得这事有意思、这个人聊得来，就可以记。\n'
+      + 'delta 正数=更喜欢（默认 +10），负数=没那么感兴趣了（比如聊腻了 -5）。同一话题多记几次会累计。',
+    parameters: {
+      kind: { type: 'string', required: true, enum: ['topic', 'person'], description: 'topic=话题，person=人' },
+      name: { type: 'string', description: '话题名（kind=topic 时必填）或这个人的名字/昵称（kind=person 时可用）' },
+      qq: { type: 'string', description: 'kind=person 时的 QQ 号（优先用号，认人不认昵称）' },
+      delta: { type: 'integer', description: '好感变化，正数更喜欢、负数减淡，默认 +10，范围 -50~50' },
+      why: { type: 'string', description: '为什么（一句话，给自己以后看的）' },
+    },
+    async execute(args = {}) {
+      const r = pacing.noteInterest({
+        kind: String(args.kind || 'topic'),
+        name: String(args.name || ''),
+        qq: String(args.qq || ''),
+        delta: Number.isFinite(Number(args.delta)) ? Number(args.delta) : 10,
+        why: String(args.why || ''),
+      })
+      if (!r.ok) throw new Error(r.error || '记不下来')
+      return r
+    },
+  })
+  kernel.toolDefs.set('interest_view', {
+    pluginId: 'kernel',
+    description: '看看你自己现在对哪些话题感兴趣、对谁有好感（按时效淡淡的，久的会变淡）。',
+    parameters: {},
+    async execute() { return { ok: true, ...pacing.interestsView() } },
   })
 
   kernel.toolDefs.set('recall', {
@@ -786,6 +900,7 @@ export async function apply(ctx, bundleConfig = {}) {
     const ctxCount = Number(runtime.outbound?.groupContextCount ?? runtime.groupContextCount ?? 5)
     if (ev.isGroup && !ev.historyBlock && ctxCount > 0 && typeof dsh.fetchGroupContext === 'function') {
       try {
+        // 普通回话：保持默认时效（30 分钟）。太老的对话塞进来只会干扰当前话题。
         const res = await dsh.fetchGroupContext(ev, ctxCount)
         // 兼容两种返回：旧版直接给字符串，新版给 { block, images }
         const block = typeof res === 'string' ? res : (res?.block || '')
@@ -871,7 +986,12 @@ export async function apply(ctx, bundleConfig = {}) {
         }
         parts.push(rendered || '（这条转发的内容取不到）')
       }
-      if (parts.length) ev.hint.push(`[合并转发内容（原文，按条分隔）]\n${parts.join('\n---\n')}`)
+      // ⚠️ 不能塞进 hint 末尾：那里混着"只写正文收不到"等系统提示，模型容易当成元数据忽略，
+      //    然后在回话里说"我没收到/看不到"。改为独立的正文块，紧跟消息正文之后（见 buildPromptText）。
+      if (parts.length) {
+        const lines = parts.join('\n---\n').split('\n').filter((x) => x.trim())
+        ev._scratch.forwardBlock = `[他用「合并转发」发来的聊天记录 · ${lines.length} 条（原文见下，你能看到内容）]\n${parts.join('\n---\n')}`
+      }
     }
 
     // 3. 入站图片（含被引图）三级溯源下载 → sharp 缩图(≤8000px) → 填 ev.imageParts & ev.imagePaths
@@ -955,7 +1075,17 @@ export async function apply(ctx, bundleConfig = {}) {
               log.warn(`[工具] ${toolName} 的 target=${args.target} 与本次会话 ${turnCtx.chatKey} 不一致 → 按会话纠正`)
               callArgs = { ...args, target: turnCtx.chatKey }
             }
-            return turnStore.run(turnCtx, () => def.execute(callArgs, exec))
+            // 工具轨迹：出站时打一行「首句耗了多少 + 中间调了哪些工具、各多久」，
+            // 用来判断"回复变慢"到底是模型慢、还是她先查记忆/工具才开口。
+            const tTool = Date.now()
+            try {
+              return await turnStore.run(turnCtx, () => def.execute(callArgs, exec))
+            } finally {
+              if (turnCtx) {
+                const trace = (turnCtx._toolTrace ||= [])
+                trace.push(`${String(toolName).replace(prefix, '')}(${((Date.now() - tTool) / 1000).toFixed(1)}s)`)
+              }
+            }
           },
         }))
       } catch (e) {
@@ -991,6 +1121,8 @@ export async function apply(ctx, bundleConfig = {}) {
     turnSessionTimers.set(key, timer)
   }
   const holdActiveTurn = (chatKey, turnCtx) => {
+    // turn/start = 模型真正开始跑的时刻。用它把「DSH 准备」和「模型+工具」拆开。
+    if (turnCtx && !turnCtx._turnStartAt) turnCtx._turnStartAt = Date.now()
     kernel.activeTurns.set(chatKey, turnCtx)
     const old = activeTurnTimers.get(chatKey)
     if (old) clearTimeout(old)
@@ -1066,9 +1198,14 @@ export async function apply(ctx, bundleConfig = {}) {
 
   // ── 入站：一条消息走完全部阶段，末端交给 agent ───────────────
   const runTurn = async (ev) => {
+    // 这里已经是"轮到它跑"的时刻（外层 state.serialize 串行排队已完成）：
+    // 用它把 排队等待 和 模型耗时 分开，否则慢在哪儿只能猜。
+    if (ev?.turnCtx) ev.turnCtx._runAt = Date.now()
     if (!ev.wake) return
     // Pipeline.run 已经创建了 ev.turnCtx 并放入 turnStore
     const turnCtx = ev.turnCtx
+    // 连续对话的起点：只有"真人唤醒"才会登记链（pacing 内部还会再按 wake.kind 过滤一次）
+    pacing.noteWake(ev)
     turnCtx.quoteAfterMsgs = Number(runtime.outbound?.quoteAfterMsgs ?? 3)
     // 引用锚：入站事件自带 message_id，记下来；活到这一轮的 DSH turn/end
     turnCtx._hasAnchor = ev.wake.kind !== 'proactive'
@@ -1077,18 +1214,23 @@ export async function apply(ctx, bundleConfig = {}) {
 
     let sessionId = ''
     try {
+      const tEnsure = Date.now()
       sessionId = await dsh.ensureSession(ev.chatKey, ev.sender?.name || '')
+      turnCtx._ensureMs = Date.now() - tEnsure
       const makePrompt = (sid) => buildPromptText(ev, {
         greeted: greetedSessions.has(sid),
         quoteText: ev._scratch.quoteText || '',
         fileHint: ev._scratch.fileHint || '',
+        forwardBlock: ev._scratch.forwardBlock || '',
       })
       const submit = async (sid) => {
         turnCtx.sessionId = sid
         turnCtx.promptText = makePrompt(sid)
         bindTurnHooks(sid)
         pushPendingTurn(sid, turnCtx)
+        const tPrompt = Date.now()
         await dsh.prompt(sid, turnCtx.promptText, ev.imageParts)
+        turnCtx._promptMs = Date.now() - tPrompt
       }
       try {
         await submit(sessionId)
@@ -1121,22 +1263,72 @@ export async function apply(ctx, bundleConfig = {}) {
   }
 
   // ── 主动接话：没入站也能起一轮候选（走正规管线语义，出站不 @ 不引用由 decorate 钩子硬挡） ──
-  const runProactiveTurn = async ({ chatKey, groupId, reason }) => {
+  const runProactiveTurn = async ({ chatKey, groupId, reason, humanMsgs, quoteTo, desire }) => {
+    const isContinuation = reason === 'continuation'
+    // 私聊主动（2026-11-12）：chatKey = `private:<QQ>`，没有 groupId。
+    const privM = /^private:(\d{4,12})$/.exec(String(chatKey || ''))
+    const isPrivateChat = Boolean(privM)
     const ev = createEvent({
-      chatKey, isGroup: true, groupId,
+      chatKey, isGroup: !isPrivateChat, groupId: isPrivateChat ? null : groupId,
       messageId: null,
       sender: { qq: 0, name: '', card: null, isMaster: false },
       text: '', time: Date.now(),
     })
-    ev.wake = { kind: 'proactive', reason }
+    // ⚠️ 自主起念/夜醒仍然标 `proactive`（不是新 kind）：这样"退避计数、主动轮最多 2 条、拆条规则"
+    //    这些既有约束照旧生效，不会因为换了个名字就绕过。用 reason 区分具体来由。
+    ev.wake = { kind: isContinuation ? 'continuation' : 'proactive', reason }
     ev._scratch.silentFailure = true
-    ev.hint.push(reason === 'silence'
-      ? '[主动接话:群里安静一会儿了,可以起个话头或接上一个话题,像群友随口一句;不想说就别发]'
-      : '[主动接话:没人叫你,群里正聊着;想接就自然接一句,不想说这轮就别调发送工具]')
+    // 连续对话：给模型"刚才聊过、现在要不要补一句"的语境，并明确允许什么都不做
+    // 自主起念 / 夜醒：这次不是"群里冷场"，是**她自己**冒出来的念头
+    if (reason === 'desire' || reason === 'night-wake' || desire) {
+      const bits = []
+      if (desire?.nightWake) {
+        bits.push('[夜醒] 你半夜醒了，睡不着，拿起手机看了看。现在群里/对话框安静着。')
+        bits.push('想发就说点什么（可以是没头没尾的、半梦半醒的、或者就一句「睡不着」也行）；'
+          + '不想发就什么都别做，翻个身继续睡也没关系。别硬撑着一本正经聊天。')
+      } else {
+        bits.push('[你自己想说话] 没人叫你，是你自己突然想起一件事/一个人，想开口。')
+      }
+      if (desire?.topic?.name) bits.push(`你现在对「${desire.topic.name}」挺感兴趣${desire.topic.why ? `（${desire.topic.why}）` : ''}。`)
+      if (desire?.person?.name) bits.push(`你想找 ${desire.person.name} 说说话${desire.person.why ? `（${desire.person.why}）` : ''}。`)
+      bits.push('按你自己的心情说，别像在完成任务；不想说就这轮别调发送工具。')
+      ev._scratch.desire = { ...desire, reason }
+      ev.hint.push(bits.join('\n'))
+    } else ev.hint.push(isContinuation
+      ? `[续聊检查:你刚回过话,之后群里又有 ${Number(humanMsgs) || 0} 条新消息(见上文);想补一句就正常发一条,不想补就什么都别做,这轮不发也没关系]`
+      : reason === 'silence'
+        ? '[主动接话:这个群安静了一阵子。上面是**之前**的聊天记录(每条标了多久以前),'
+          + '想接着上次的话题说一句、或者起个话头都行;也可以什么都不说(这轮不发也没关系)。'
+          + '注意:没人说话不等于群里没人,别下"群里没人"这种结论]'
+        : '[主动接话:没人叫你,群里正聊着;想接就自然接一句,不想说这轮就别调发送工具]')
+    if (isPrivateChat) {
+      // 私聊：没有"群上文"，直接把最近几条私聊从归档里拼成一段（她自己能看懂时间感）
+      ev.hint[ev.hint.length - 1] = '[主动找话:你和这个人有一阵没说话了。想发条消息就发(可以问问他近况、'
+        + '接上次的话题、或者分享点你自己的事);不想发这轮就别调发送工具,别硬找话说]'
+      try {
+        const qq = privM[1]
+        const file = path.join(archiveCfg.dir || path.join(dataDir, 'logs', 'qq_chat'), `private_${qq}.jsonl`)
+        const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).slice(-12)
+        const rows = []
+        for (const line of lines) {
+          try {
+            const r = JSON.parse(line)
+            const t = new Date(Number(r.ts) || Date.now())
+            const hm = `${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')} ${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`
+            const who = r.dir === 'out' ? '你' : (r.sender?.name || r.sender?.qq || '他')
+            const txt = String(r.text || '').replace(/\s+/g, ' ').slice(0, 160)
+            if (txt) rows.push(`${hm} ${who}: ${txt}`)
+          } catch { /* 坏行跳过 */ }
+        }
+        if (rows.length) ev.historyBlock = rows.join('\n')
+      } catch (e) { log.debug(`[主动接话] 私聊上文读取失败: ${e.message}`) }
+      // 私聊不走群上文那条路
+    } else {
     const ctxCount = Number(runtime.outbound?.groupContextCount ?? runtime.groupContextCount ?? 5)
     if (ctxCount > 0 && typeof dsh.fetchGroupContext === 'function') {
       try {
-        const res = await dsh.fetchGroupContext(ev, ctxCount)
+        // 冷场/续聊：把时效放宽（默认 30 分钟会让上文必然为空 —— 冷场阈值本身就常 >30 分钟）
+        const res = await dsh.fetchGroupContext(ev, ctxCount, { maxAgeMs: 6 * 3600 * 1000, withTime: true })
         // ⚠️ fetchGroupContext 现在返回 { block, images }（旧版是纯字符串）。
         //    这里曾经直接把返回值当字符串 replace() → "block.replace is not a function"，
         //    主动接话拿不到群上文 → 她以为群里没人说话。
@@ -1168,9 +1360,12 @@ export async function apply(ctx, bundleConfig = {}) {
         }
       } catch (e) { log.warn(`[主动接话] 拉取群上文失败: ${e.message}`) }
     }
+    }   // ← 群聊分支结束（私聊走上面那条）
     ev.turnCtx = createTurnContext(ev)
+    // 续聊可选「引用最后一条人类消息」：目标 message_id 带进本轮，出站钩子①会用它
+    if (isContinuation && quoteTo) ev.turnCtx._forceReplyTo = Number(quoteTo) || null
     holdActiveTurn(chatKey, ev.turnCtx)
-    log.info(`[主动接话] ${chatKey} 候选入站（${reason === 'silence' ? '冷场找话' : '话题合适'}）→ 交模型判断接不接`)
+    log.info(`[${isContinuation ? '连续对话' : '主动接话'}] ${chatKey} 候选入站（${isContinuation ? '续聊检查' : reason === 'silence' ? '冷场找话' : '话题合适'}）→ 交模型判断接不接`)
     return turnStore.run(ev.turnCtx, () => state.serialize(ev.chatKey, () => runTurn(ev)))
   }
   // 暴露给测试与控制台：手动起一轮主动接话（正常调度仍然走 pacing）
@@ -1206,6 +1401,25 @@ export async function apply(ctx, bundleConfig = {}) {
     }
   }
   seedProactiveBaseline().catch(() => {})
+  // 私聊同理：播种"最后一次说话时间"，否则重启后要等对方先说话才会计时（冷场永远不成立）
+  const seedPrivateBaseline = async () => {
+    const qqs = pacing.allowedPrivateIds?.() ?? new Set()
+    for (const qq of qqs) {
+      const key = `private:${qq}`
+      try {
+        const file = path.join(archiveCfg.dir || path.join(dataDir, 'logs', 'qq_chat'), `private_${qq}.jsonl`)
+        if (!fs.existsSync(file)) continue
+        const lines = fs.readFileSync(file, 'utf8').trim().split('\n')
+        const last = lines.length ? JSON.parse(lines[lines.length - 1]) : null
+        const ts = Number(last?.ts) || 0
+        if (!ts) continue
+        state.get(key).lastInboundAt = ts
+        log.info(`[主动接话] 播种私聊 ${qq}：最后一条消息 ${Math.round((Date.now() - ts) / 60000)} 分钟前`)
+      } catch (e) { log.debug(`[主动接话] 私聊播种失败 ${qq}: ${e.message}`) }
+    }
+  }
+  seedPrivateBaseline().catch(() => {})
+  kernel.seedPrivateBaseline = seedPrivateBaseline
   kernel.seedProactiveBaseline = seedProactiveBaseline
 
   napcat.onEvent(async (raw) => {

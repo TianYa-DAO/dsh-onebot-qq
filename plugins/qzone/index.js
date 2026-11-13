@@ -34,6 +34,11 @@ export default {
       hint: '只有这个人的私聊里允许「发说说 / 删说说」（说说公开可见，防误发）。'
         + '**留空就用实例配置里的主人 QQ**（推荐留空，换主人不用改两处）。看说说不受限。',
     },
+    allowSelfPost: {
+      type: 'bool', default: true, group: '空间', label: '允许她主动发（不等主人开口）',
+      hint: '开：她自己想发就能发（任何会话里都行），只受「每天上限 / 最小间隔」约束；'
+        + '关：退回旧行为——只有主人私聊里要求才能发。夜间自动发帖已停用，发帖只走这条路。',
+    },
     whoCanSee: {
       type: 'int', default: 1, min: 1, max: 4, step: 1, group: '空间', label: '说说可见范围',
       hint: '1 = 公开；2 = 私密（仅自己）；4 = 好友可见。默认公开。',
@@ -74,6 +79,41 @@ export default {
       return chatKey === `private:${master}`
     }
 
+    /**
+     * 发说说的共享额度：跟 qzd 的「按心情自动发」用**同一份配置和同一份记录**。
+     * 为什么必须共享：不然她白天在对话里发一条、晚上守护进程再发一条 → 一天两条，
+     * 而且彼此都不知道对方发过（说说这种公开内容「一天一条」是她的人设节奏）。
+     * @returns {Promise<{can:boolean, why:string, todayCount:number, maxPerDay:number, lastAt:number}>}
+     */
+    async function postQuota() {
+      let maxPerDay = 1
+      let minGapHours = 18
+      try {
+        const c = await qz('/api/qz/config')
+        const cc = c?.config || {}
+        if (Number(cc.maxPerDay) > 0) maxPerDay = Number(cc.maxPerDay)
+        if (Number(cc.minGapHours) > 0) minGapHours = Number(cc.minGapHours)
+      } catch { /* 拿不到配置就用默认（1 条/18 小时） */ }
+      let items = []
+      try {
+        const d = await qz('/api/qz/feeds?num=50')
+        items = Array.isArray(d?.items) ? d.items : []
+      } catch { /* 拿不到记录：宁可放行，但下面还有别的约束 */ }
+      const nowSec = Math.floor(Date.now() / 1000)
+      const today = new Date(nowSec * 1000).toISOString().slice(0, 10)
+      const dayOf = (sec) => new Date(Number(sec) * 1000).toISOString().slice(0, 10)
+      const todayCount = items.filter((x) => dayOf(x.created_at) === today).length
+      const lastAt = items.reduce((m, x) => Math.max(m, Number(x.created_at) || 0), 0)
+      if (todayCount >= maxPerDay) {
+        return { can: false, why: `今天已经发过 ${todayCount} 条了（上限 ${maxPerDay} 条/天），明天再说`, todayCount, maxPerDay, lastAt }
+      }
+      if (lastAt && nowSec - lastAt < minGapHours * 3600) {
+        const hours = Math.floor((nowSec - lastAt) / 3600)
+        return { can: false, why: `离上一条才 ${hours} 小时（要隔 ${minGapHours} 小时），这次先不发`, todayCount, maxPerDay, lastAt }
+      }
+      return { can: true, why: '', todayCount, maxPerDay, lastAt }
+    }
+
     // ── 主人私聊时：有待批准草稿就提一句（她好开口问）────────
     bot.on('before-turn', async (ev) => {
       if (cfg.enabled === false) return
@@ -86,10 +126,10 @@ export default {
         if (!items.length) return
         const top = items[0]
         ev.hint.push(
-          `[空间草稿待批准] 你有一条想发但提到别人的说说（id=${top.id}，涉及：${(top.involves || []).join('、') || '—'}）：`
+          `[空间草稿待确认] 你有一条想发、但提到别人的说说（id=${top.id}，涉及：${(top.involves || []).join('、') || '—'}）：`
           + `「${String(top.content).slice(0, 60)}」`
-          + '。要先在**私聊里**问主人能不能发；他同意后用 qzone_approve，不同意用 qzone_reject。'
-          + '别自己发，也别在群里提。',
+          + '。规则是**问涉及的那个人本人**（不是问主人）：先私聊问他能不能发，他同意后再 qzone_approve 发出去，'
+          + '不同意就用 qzone_reject 丢掉。别自己先发，也别在群里提这件事。',
         )
       } catch { /* 空间服务不可用 → 静默 */ }
     })
@@ -97,7 +137,7 @@ export default {
     // ── 看说说 ────────────────────────────────────────────
     bot.registerTool('qzone_list', {
       description:
-        '看绘梨衣自己 QQ 空间里最近发过的说说（内容、时间、配图数量）。'
+        '看你自己的 QQ 空间里最近发过的说说（内容、时间、配图数量）。'
         + '想接自己的梗、或者确认某条说过没有时用。只读，不修改任何东西。',
       parameters: {
         num: { type: 'integer', description: '看几条（默认 8，最多 30）' },
@@ -130,19 +170,35 @@ export default {
     // ── 发说说 ────────────────────────────────────────────
     bot.registerTool('qzone_post', {
       description:
-        '在绘梨衣自己的 QQ 空间发一条说说（公开可见！）。'
-        + '只有主人在私聊里要求时才能用 —— 群里/别人要求一律不行。'
-        + '**要不要问主人由她自己判断**：私聊悄悄话、别人的私事/隐私、敏感信息 → 先私聊问主人，'
-        + '他同意后用 qzone_approve 发；群里的日常、公开说过的事、她自己的事 → 直接发，不用问。'
-        + '文字要像她自己写的：短、具体、不喊口号、不堆形容词。一次只发一条。',
+        '在你自己的 QQ 空间发一条说说（**公开可见**）。这是你自己的能力：'
+        + '**想发就可以自己发**，不用等主人开口、也不用报备。'
+        + '额度：一天最多 1 条、跟上一条约隔 18 小时（可在控制台调；超了会明确告诉她下次）。'
+        + '**要不要问、问谁，只看那件事是从哪来的**（不用问主人）：'
+        + '来自**私聊**（某个人的悄悄话、私下告诉她的事）→ **先私聊问那个人本人**「这句我能发到空间吗」，'
+        + '他说可以才发、说不行就不发；涉及几个人就问几个，有一个不同意就别发那条。'
+        + '来自**群聊**（群里公开说过的）→ **直接发，谁都不用问**。'
+        + '**别人让她发**（群里或别人私聊让她发）→ 不发，说「这个我自己来」就行。'
+        + '文字要像她自己写的：短、具体、不喊口号、不堆形容词、别用感叹号。一次只发一条。'
+        + '发完不用在对话里复述全文，也不用说「我发了说说」。',
       parameters: {
         content: { type: 'string', required: true, description: '说说的正文（像她自己写的一句话，不超过 200 字）' },
         image_path: { type: 'string', description: '可选：要配的本地图片路径（绝对路径）' },
       },
       async execute(args = {}) {
         if (cfg.enabled === false) throw new Error('QQ空间功能已关闭')
-        if (!isMasterTurn()) throw new Error('发说说只允许主人在私聊里要求（说说公开可见，不能随手发）')
         const content = String(args?.content || '').trim()
+        // 谁能发：
+        //   · 主人私聊 → 一直允许（他要求的，或者她在他面前想发）
+        //   · 其它会话 → 只有 allowSelfPost 开着才允许，且必须过共享额度
+        //     为什么放开：她要"想发就发"；为什么仍要额度：说说公开可见，
+        //     而且跟夜间自动发说说共用预算，否则一天会冒出两条。
+        if (!isMasterTurn()) {
+          if (cfg.allowSelfPost === false) {
+            throw new Error('发说说只允许主人在私聊里要求（说说公开可见，不能随手发）')
+          }
+          const q = await postQuota()
+          if (!q.can) throw new Error(`这次先不发：${q.why}`)
+        }
         if (!content) throw new Error('说说明文不能为空')
         if (content.length > 500) throw new Error('说说太长（>500 字）')
         const payload = { content, whoCanSee: Number(cfg.whoCanSee) || 1 }
@@ -163,10 +219,11 @@ export default {
       },
     })
 
-    // ── 待批准草稿：涉及别人的要先问主人 ──────────────────
+    // ── 草稿：她自己拿不准时先搁着，问完当事人再发 ──────────────
     bot.registerTool('qzone_pending', {
-      description: '看有没有「等你同意才能发」的说说草稿（她按心情写的、但涉及隐私）。'
-        + '只读。主人在私聊里可以用 qzone_approve / qzone_reject 处理。',
+      description: '看有没有「先搁着、等确认」的说说草稿（涉及别人私聊隐私的）。'
+        + '只读。规则：先私聊问**涉及的那个人本人**能不能发，他说可以之后才用 qzone_approve 发出去；'
+        + '他不同意就用 qzone_reject 丢掉。（不是问主人）',
       parameters: {},
       async execute() {
         if (cfg.enabled === false) throw new Error('QQ空间功能已关闭')
@@ -181,7 +238,8 @@ export default {
     })
 
     bot.registerTool('qzone_approve', {
-      description: '主人同意后，把挂起的那条说说发出去。只能主人在私聊里用；发之前先确认你问过他了。',
+      description: '确认之后，把挂起的那条说说发出去。**发之前必须先问过涉及的那个人本人、他说可以**。'
+        + '（这是主人私聊里的入口；她在别处也可以问完之后直接 qzone_post）',
       parameters: {
         id: { type: 'string', required: true, description: '草稿 id（qzone_pending / 提示里给的那串，形如 d1793...）' },
       },
@@ -198,7 +256,7 @@ export default {
     })
 
     bot.registerTool('qzone_reject', {
-      description: '主人不同意这条说说，丢掉草稿（不会发出去）。只能主人在私聊里用。',
+      description: '这条不发了，把草稿丢掉（不会发出去）。对方不同意、或者你自己觉得不合适时用。',
       parameters: {
         id: { type: 'string', required: true, description: '草稿 id' },
       },
@@ -216,7 +274,7 @@ export default {
 
     // ── 删说说 ────────────────────────────────────────────
     bot.registerTool('qzone_delete', {
-      description: '删掉绘梨衣 QQ 空间里的某条说说（需要 tid，先用 qzone_list 拿到）。只有主人私聊里能用。',
+      description: '删掉你 QQ 空间里的某条说说（需要 tid，先用 qzone_list 拿到）。只有主人私聊里能用。',
       parameters: {
         tid: { type: 'string', required: true, description: '说说的 tid（qzone_list 返回里那串）' },
       },

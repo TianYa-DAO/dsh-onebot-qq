@@ -17,6 +17,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { isInsidePath } from '../../platform/paths.js'
+// 有界媒体读取（按**实际读取字节**限流，而不是只信 Content-Length / 声明大小）
+import { readLocalBytes, fetchBytes } from '../../kernel/media-bytes.js'
 import { cqImage } from '../../platform/cq-file.js'
 
 /** target 只认这两种形态（sendImageTo 的校验口径） */
@@ -96,24 +98,16 @@ function destName(name) {
  *   · 只有 fileId 时回 NapCat 溯源（url 会过期，fileId 才是把手）；
  *   · 都拿不到 → 抛错（如实把失败写进 hint，比静默吞掉强：模型能看出文件没到）。
  */
-async function fetchFileBytes(bot, f) {
+async function fetchFileBytes(bot, f, maxBytes) {
   const src = String(f?.url || f?.path || '')
-  if (src && fs.existsSync(src)) return fs.readFileSync(src)
-  if (/^https?:\/\//.test(src)) {
-    const res = await fetch(src, { signal: AbortSignal.timeout(FILE_TIMEOUT_MS) })
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    return Buffer.from(await res.arrayBuffer())
-  }
+  if (src && fs.existsSync(src)) return readLocalBytes(src, { maxBytes })
+  if (/^https?:\/\//.test(src)) return fetchBytes(src, { maxBytes, timeoutMs: FILE_TIMEOUT_MS })
   // 溯源 NapCat 本地缓存；适配器把这个能力叫 getFile（只读视图已暴露）
   if (f?.fileId && typeof bot.napcat?.getFile === 'function') {
     const info = await bot.napcat.getFile(f.fileId)
     const local = info?.file
-    if (local && fs.existsSync(local) && fs.statSync(local).isFile()) return fs.readFileSync(local)
-    if (info?.url && /^https?:\/\//.test(info.url)) {
-      const res = await fetch(info.url, { signal: AbortSignal.timeout(FILE_TIMEOUT_MS) })
-      if (!res.ok) throw new Error(`溯源直链 HTTP ${res.status}`)
-      return Buffer.from(await res.arrayBuffer())
-    }
+    if (local && fs.existsSync(local) && fs.statSync(local).isFile()) return readLocalBytes(local, { maxBytes })
+    if (info?.url && /^https?:\/\//.test(info.url)) return fetchBytes(info.url, { maxBytes, timeoutMs: FILE_TIMEOUT_MS })
   }
   throw new Error(src ? `无法识别的文件地址: ${src.slice(0, 80)}` : '文件段没有可取的地址（缺 url）')
 }
@@ -235,12 +229,8 @@ export default {
           continue
         }
         try {
-          const buf = await fetchFileBytes(bot, f)
-          if (limitBytes && buf.length > limitBytes) {
-            ev.hint.push(`[文件: ${label} 超过上限 ${maxMB}MB，未接收]`)
-            log.info(`跳过超大入站文件 ${label}（下载后 ${buf.length} 字节 > ${limitBytes}）`)
-            continue
-          }
+          // 把上限直接交给读取层：按**实际读到的字节**边读边掐，不再只信声明的 size
+          const buf = await fetchFileBytes(bot, f, limitBytes)
           const dest = path.join(dir, destName(label))
           fs.writeFileSync(dest, buf)
           // hint 会原样拼进 prompt：让模型知道"用户发了这个文件、在服务器哪儿"
@@ -249,7 +239,9 @@ export default {
         } catch (e) {
           // 落盘失败也如实告知；不抛，别让一个坏文件拖垮整条消息
           log.warn(`QQ 文件接收失败 (${label}): ${e.message}`)
-          ev.hint.push(`[文件: ${label} 保存失败: ${e.message}]`)
+          ev.hint.push(e?.code === 'MEDIA_TOO_LARGE'
+            ? `[文件: ${label} 超过上限 ${maxMB}MB，未接收]`
+            : `[文件: ${label} 保存失败: ${e.message}]`)
         }
       }
     }

@@ -40,7 +40,37 @@ fi
 # 立刻把补丁守护跑一次，确认补丁仍在（防止同步时把打过补丁的文件冲成上游原样）
 /home/ubuntu/napcat-setup/reapply-patches.sh "$DST" >/dev/null 2>&1 || true
 
+# ── 写"待验证"标记：重启后自动验证脚本会读它，把这次部署了什么记进结果 ──
+PENDING=/home/ubuntu/.dsh/dsh-onebot-qq/deploy-pending.json
+mkdir -p "$(dirname "$PENDING")"
+python3 - "$PENDING" "$SRC" <<'PY2'
+import json, sys, subprocess, datetime
+out, src = sys.argv[1], sys.argv[2]
+def sh(c):
+    try: return subprocess.check_output(c, cwd=src, shell=True, text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception: return ''
+json.dump({
+    'at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    'commit': sh('git rev-parse --short HEAD'),
+    'dirty': bool(sh('git status --porcelain')),
+    'changedFiles': [x for x in sh('git status --porcelain').split('\n') if x.strip()][:30],
+}, open(out, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+PY2
+[ -f "$PENDING" ] && chown ubuntu:ubuntu "$PENDING" 2>/dev/null || true
+
 UNIT=dsh-restart-$(date +%H%M%S)
 sudo systemd-run --unit="$UNIT" --collect --description="dsh-web restart (dev-deploy)" \
   /home/ubuntu/dsh-workspace/dsh-restart-helper.sh 40 2>&1 | tail -1
+
+# ── 自动排定部署验证（关键：不依赖任何 agent 会话/提醒）──
+# 重启在 40s 后，验证脚本自己会再等 dsh-web 变 active（最多 150s）。
+VERIFY_UNIT=dsh-verify-$(date +%H%M%S)
+sudo systemd-run --unit="$VERIFY_UNIT" --collect --description="post-deploy verify" \
+  --on-active=55 \
+  /home/ubuntu/dsh-onebot-qq-src/scripts/post-deploy-verify.sh >/dev/null 2>&1 \
+  && echo "✅ 已自动排定部署验证（${VERIFY_UNIT}，55 秒后运行）" \
+  || echo "⚠️ 排定部署验证失败——重启后请手动跑 scripts/post-deploy-verify.sh"
+
 echo "已排定 40 秒后重启。重启后新登录链接见 ~/dsh-workspace/dsh-login-url.txt"
+echo "验证结果：~/.dsh/dsh-onebot-qq/deploy-last-result.json ｜ ~/dsh-workspace/部署验证日志.md"
+echo "（失败时会出现：~/dsh-workspace/⚠️部署验证失败.txt）"

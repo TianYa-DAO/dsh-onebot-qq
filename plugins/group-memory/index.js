@@ -47,6 +47,38 @@ export default {
       type: 'bool', default: true, group: '群记忆', label: '自动积累群记忆',
       hint: '开：按下面的间隔，把各群最近的聊天交给模型，自动更新记忆文件；关：完全不跑（仍可手动「立刻积累一轮」）。',
     },
+    mutedChats: {
+      type: 'group', default: [], group: '群记忆', label: '单独关掉记忆的会话',
+      hint: '填 `group:群号` 或 `private:QQ号`，多个用逗号分隔（如 group:10001,private:10002）。'
+        + '关掉的会话：不注入指针、不读、不积累，但已有记忆仍可在控制台查看/编辑/删除。留空 = 全部开启。',
+    },
+    accumulateSchedule: {
+      type: 'enum', default: 'daily', group: '群记忆', label: '积累调度',
+      options: [{ value: 'daily', label: '每日整理互动（推荐）' }, { value: 'interval', label: '旧版间隔积累（兼容）' }],
+      hint: '每日模式：每天定时（见下）逐会话整理本机的互动，结构化增删改（稳定/近期/约定三区）；'
+        + '间隔模式：保留旧版「每 N 小时一轮 + 聊完就收一次」的增量行为。'
+        + '每日模式更不容易漂移，但需要多一次后台模型调用/会话/天。',
+    },
+    accumulateDailyTime: {
+      type: 'str', default: '04:00', group: '群记忆', label: '每日执行时间',
+      hint: '24 小时制 HH:mm，按下面的时区执行。停机错过后恢复会补跑一次。',
+    },
+    accumulateTimezone: {
+      type: 'str', default: 'Asia/Shanghai', group: '群记忆', label: '执行时区',
+      hint: 'IANA 时区名，例如 Asia/Shanghai。填错会停止调度并在状态里显示错误。',
+    },
+    accumulateRecentDays: {
+      type: 'int', default: 14, min: 1, max: 90, group: '群记忆', label: '近期经历保留天数', unit: '天',
+      hint: '只有「近期记忆」会自动到期；「稳定记忆」「约定与承诺」不按这个时间自动删除。',
+    },
+    accumulateModelProvider: {
+      type: 'str', default: '', group: '群记忆', label: '记忆分析模型 · provider（可留空）',
+      hint: '留空 = 跟日常模型一致。要和下一项**成对填写**；只填一个会报错并保留待处理素材。',
+    },
+    accumulateModel: {
+      type: 'str', default: '', group: '群记忆', label: '记忆分析模型 · model（可留空）',
+      hint: '留空 = 跟日常模型一致。填了会走隔离的后台会话，不影响她日常聊天的模型。',
+    },
     accumulateIntervalHours: {
       type: 'int', default: 8, min: 1, max: 24, step: 1, group: '群记忆', label: '积累间隔', unit: '小时',
       hint: '多久跑一轮。每轮只处理「有新消息的群」；默认一批一次模型调用（群多时按下面的上限自动拆批）。',
@@ -91,6 +123,18 @@ export default {
     accumulateMinNewMsgs: {
       type: 'int', default: 20, min: 0, max: 500, step: 5, group: '群记忆', label: '少于多少条就跳过',
       hint: '某个群最近消息太少时跳过、不调模型（省 token）。0 = 只要有一条就积累。',
+    },
+    accumulateIdleMin: {
+      type: 'int', default: 30, min: 0, max: 720, step: 5, group: '群记忆', label: '聊完多久后立刻沉淀',
+      unit: '分钟',
+      hint: '会话（群或私聊）安静这么多分钟后，不等每日定时，立刻把这个会话这轮聊的内容提炼进记忆。'
+        + '聊天中途沉淀会提炼出半截对话，所以等安静了再收。0 = 关闭，只按每日定时积累。',
+      label: '聊完多久后立刻沉淀（闲置触发）',
+    },
+    accumulateIdleMinMsgs: {
+      type: 'int', default: 3, min: 1, max: 100, step: 1, group: '群记忆', label: '聊完沉淀至少几条',
+      hint: '会话级沉淀（聊完就收）要求至少有几条**别人**的消息。她自己的自言自语不算 ——'
+        + '否则死群里她主动接话、没人应、30 分钟后又把那几句话沉淀回记忆，会空转重复录入。',
     },
     accumulateRetainRevisions: {
       type: 'int', default: 20, min: 0, max: 200, step: 5, group: '群记忆', label: '保留多少历史版本',
@@ -144,7 +188,38 @@ export default {
       return cut.slice(0, nl > 0 ? nl : cut.length).replace(/\r$/, '') + '\n…（本群记忆过长已截断，请精简文件）'
     }
 
-    const fileOf = (gid) => path.join(dirOf(), `${gid}.md`)
+    /**
+     * 会话键：`group:<群号>` / `private:<QQ号>`。私聊也有自己的一篇长期记忆（摘自上游戏 2026-11-06）。
+     * 私聊记忆放在 `<记忆目录>/private/<QQ>.md`，与群记忆分目录 —— 群号/QQ 号可能撞数字，混在一起会串。
+     */
+    const chatKeyOf = (ev) => {
+      if (!ev) return null
+      if (ev.isGroup) {
+        const gid = String(ev.groupId ?? '')
+        if (/^\d{4,12}$/.test(gid)) return `group:${gid}`
+        const m = /^group:(\d{4,12})$/.exec(String(ev.chatKey || ''))
+        return m ? `group:${m[1]}` : null
+      }
+      const qq = String(ev.sender?.qq ?? '')
+      if (/^\d{4,12}$/.test(qq)) return `private:${qq}`
+      const m = /^private:(\d{4,12})$/.exec(String(ev.chatKey || ''))
+      return m ? `private:${m[1]}` : null
+    }
+    /** 会话键 → 记忆文件路径（也是防路径穿越的唯一出入口：键里只允许数字） */
+    const fileOfKey = (key) => {
+      const k = String(key || '')
+      const g = /^group:(\d{4,12})$/.exec(k)
+      if (g) return path.join(dirOf(), `${g[1]}.md`)
+      const pv = /^private:(\d{4,12})$/.exec(k)
+      if (pv) return path.join(dirOf(), 'private', `${pv[1]}.md`)
+      return null
+    }
+    /** 每个会话可以单独关掉记忆（不注入指针、不读、不积累）；已有记忆仍可查看/编辑。 */
+    const mutedOf = (key) => {
+      const list = Array.isArray(cfg.mutedChats) ? cfg.mutedChats.map(String) : []
+      return list.includes(String(key || ''))
+    }
+    const fileOf = (gid) => fileOfKey(`group:${gid}`)
 
     /**
      * 读原文（只剥 BOM 与行尾记账注释，**不按 maxBytes 截断**）。
@@ -153,8 +228,11 @@ export default {
      * ⚠️ 积累器必须用原文：它的「合并 → 整篇写回」如果拿截断后的文本当基准，
      *    超过 maxBytes 的尾部每轮都会丢（旧版的 bug，见读写口径分离）。
      */
-    function loadRaw(gid) {
-      const file = fileOf(gid) // gid 已过 4–12 位纯数字校验 → 不会有路径穿越
+    /** 允许传 `group:123` / `private:123` / 纯群号（旧调用），统一成文件路径 */
+    const asKey = (k) => (/^(group|private):\d{4,12}$/.test(String(k || '')) ? String(k) : `group:${k}`)
+    function loadRaw(keyOrGid) {
+      const file = fileOfKey(asKey(keyOrGid)) // 键里只允许数字 → 不会有路径穿越
+      if (!file) return null
       let st
       try { st = fs.statSync(file) } catch { return null } // 没文件 = 没记忆
       const stamp = `${st.mtimeMs}:${st.size}`
@@ -170,14 +248,14 @@ export default {
     }
 
     /** 给积累器/备份用：不截断。 */
-    function readRaw(gid) {
-      const r = loadRaw(gid)
+    function readRaw(key) {
+      const r = loadRaw(key)
       return r ? { text: r.text, stamp: r.stamp, bytes: r.bytes } : null
     }
 
     /** 给模型用：按 maxBytes 截断（只影响进上下文的文本，不影响写盘基准）。 */
-    function readMemory(gid) {
-      const r = loadRaw(gid)
+    function readMemory(key) {
+      const r = loadRaw(key)
       if (!r) return null
       const text = clip(r.text).trim()
       return { text, stamp: r.stamp, clipped: text.length < r.text.trim().length, bytes: r.bytes }
@@ -186,44 +264,88 @@ export default {
     // ── 入口 ①：before-turn 只推一行指针（首次 / 有更新；未变化 0 字符） ──────────
     bot.on('before-turn', (ev) => {
       if (cfg.enabled === false || !ev.wake) return // 没唤醒的消息不进模型，提示串也没用
-      if (ev.wake.kind === 'welcome') return // 入群欢迎轮不该被"读群记忆"的指针分心
-      const gid = groupIdOf(ev)
-      if (!gid) return
-      const mem = readMemory(gid)
+      if (ev.wake.kind === 'welcome') return // 入群欢迎轮不该被"读记忆"的指针分心
+      const key = chatKeyOf(ev)
+      if (!key) return
+      if (mutedOf(key)) { log.debug(`[记忆] ${key} 已单独关闭 → 不注入指针`); return }
+      const mem = readMemory(key)
       if (!mem) return // 没记忆文件 = 什么都不加（积累器还没跑过）
+      const isPrivate = key.startsWith('private:')
       const prev = getSeen(ev.chatKey)
       if (!prev) {
         setSeen(ev.chatKey, mem.stamp)
-        ev.hint.push('[本群记忆: 调工具 read_memory 可看本群的说话风格与群友画像；'
-          + '第一次在本群回话前建议先读一次。**认人只看 QQ 号**（群友常换昵称，同一人换了名字仍是同一人）]')
-        log.debug(`[群记忆] ${gid} 本会话首次 → 只给指针（${mem.text.length} 字不再贴正文）`)
+        ev.hint.push(isPrivate
+          ? '[本私聊记忆: 调工具 read_memory 可看你和这个人的长期记忆（他的近况、说过的事、约定）；'
+            + '第一次跟他聊建议先读一次。**认人只看 QQ 号**]'
+          : '[本群记忆: 调工具 read_memory 可看本群的说话风格与群友画像；'
+            + '第一次在本群回话前建议先读一次。**认人只看 QQ 号**（群友常换昵称，同一人换了名字仍是同一人）]')
+        log.debug(`[记忆] ${key} 本会话首次 → 只给指针（${mem.text.length} 字不再贴正文）`)
       } else if (prev !== mem.stamp) {
         setSeen(ev.chatKey, mem.stamp)
-        ev.hint.push('[本群记忆已更新，需要时调 read_memory 重读]')
-        log.debug(`[群记忆] ${gid} 内容有更新 → 只给指针`)
+        ev.hint.push(isPrivate ? '[本私聊记忆已更新，需要时调 read_memory 重读]' : '[本群记忆已更新，需要时调 read_memory 重读]')
+        log.debug(`[记忆] ${key} 内容有更新 → 只给指针`)
       } else {
-        log.debug(`[群记忆] ${gid} 未变化，本轮不提示`) // 0 字符
+        log.debug(`[记忆] ${key} 未变化，本轮不提示`) // 0 字符
       }
     })
+
+    /**
+     * 把整篇群记忆压成「摘要视图」（L0/L1 思路，借自 OpenViking）：
+     *   开场前言（两三行）+ 每个小节只给标题和首行。
+     * 为什么需要：单群记忆会涨到 20KB，模型一眼读进来全是 token；
+     *   而绝大多数时候它只想确认"这个群我记过什么、有没有这个人"，不需要每条细节。
+     * 纯派生自现有文件 —— 不改沉淀 prompt、不额外调模型、不动数据格式。
+     */
+    function compactMemory(text, limit = 700) {
+      const lines = String(text || '').split('\n')
+      const preamble = []
+      const sections = []
+      let cur = null
+      for (const line of lines) {
+        const m = /^##\s+(.+?)\s*$/.exec(line)
+        if (m) { cur = { title: m[1], first: '' }; sections.push(cur); continue }
+        if (cur) {
+          if (!cur.first && line.trim()) cur.first = line.trim()
+        } else if (line.trim()) preamble.push(line.trim())
+      }
+      const out = []
+      if (preamble.length) out.push(preamble.slice(0, 3).join('\n'))
+      for (const sec of sections) {
+        out.push(sec.first ? `## ${sec.title}\n${clipOne(sec.first, 80)}` : `## ${sec.title}`)
+      }
+      let s2 = out.join('\n')
+      if (s2.length > limit) s2 = `${s2.slice(0, limit)}…`
+      return { text: s2, sections: sections.length }
+    }
+    function clipOne(t, n) {
+      const s0 = String(t || '')
+      return s0.length > n ? `${s0.slice(0, n)}…` : s0
+    }
 
     // ── 入口 ②：工具 read_memory（只读本群那一篇；群里没有文件权限，这是唯一的"翻记忆"路） ──
     bot.registerTool('read_memory', {
       description:
-        '读本群的长期记忆：这个群怎么把机器人叫起来、该怎么回话（语气/长度/称呼/忌讳），以及群里每个人的特点。\n'
+        '读本会话的长期记忆：群里是「这个群怎么把机器人叫起来、该怎么回话、群里每个人的特点」；'
+        + '私聊是「你和这个人之间的事、他的近况与约定」。\n'
         + '这份记忆与人设解耦：里面提到机器人自己一律用「我」，不写人设。'
         + '**认人只看 QQ 号**：条目形如 `- **昵称(QQ)**：…`，群里的人常换昵称，同一个 QQ 换了名字仍是同一个人'
         + '（按 QQ 对上他，别当成新面孔）。第一次在本群回话前建议先读一次；同一会话读一次就够，'
-        + '之后收到「本群记忆已更新」提示时再重读。只对群会话有效，读不到本群以外的任何文件。',
+        + '之后收到「本群记忆已更新」提示时再重读。只对群会话有效，读不到本群以外的任何文件。\n'
+        + '**默认返回摘要视图**（每个小节只给标题+首行）：确认"记过什么、有没有这个人"够用了。'
+        + '确实需要某条细节（比如某人的完整印象）时，再传 detail:true 读全文。',
       // DSH `defineTool` 的 parameters 是**扁平**的「属性名 → 值 schema」映射；required 写在属性上。
       parameters: {
         target: { type: 'string', required: true, description: '会话目标，形如 group:123456（通常填本轮会话，见开头 [QQ会话 …]）' },
+        detail: { type: 'boolean', description: 'true = 返回全文（长，几百到上万字）；默认 false = 摘要视图（各小节标题+首行）' },
       },
       execute(args) {
         const target = String(args?.target || '')
-        const m = /^group:(\d{4,12})$/.exec(target) // 4–12 位纯数字：顺手挡路径穿越，也挡住唤醒词表里的 "*"
-        if (!m) throw new Error('read_memory 只对群会话有效（target 形如 group:123456）')
-        if (cfg.enabled === false) throw new Error('群记忆读取已关闭')
-        const gid = m[1]
+        // 群、私聊都支持（私聊记忆 2026-11-12 摘自上游戏）：4–12 位纯数字顺手挡路径穿越
+        const m = /^(group|private):(\d{4,12})$/.exec(target)
+        if (!m) throw new Error('read_memory 的 target 形如 group:123456 或 private:123456')
+        if (cfg.enabled === false) throw new Error('记忆读取已关闭')
+        if (mutedOf(target)) throw new Error('这个会话的记忆被单独关掉了（设置里 🔕）')
+        const gid = m[2]
         // 只读本群：拿本轮会话当边界。别的群号不可能是本轮 → 拒绝，别让这条路变成读别的群
         const turn = bot.currentTurn()
         // fail-closed：认不出本轮会话就拒绝（超长回合 currentTurn 可能是 null，
@@ -232,11 +354,27 @@ export default {
         if (turn.chatKey !== target) {
           throw new Error(`只能读本群记忆（本轮会话是 ${turn.chatKey}，不是 ${target}）`)
         }
-        const mem = readMemory(gid)
-        if (!mem) return { ok: true, target, memory: '', hint: '本群还没有记忆文件（积累器还没跑过）' }
-        log.info(`[群记忆] 自读 ${gid} → ${mem.text.length} 字${mem.clipped ? '（已按上限截断）' : ''}`)
+        const mem = readMemory(target)
+        if (!mem) return { ok: true, target, memory: '', hint: '这个会话还没有记忆文件（积累器还没跑过）' }
+        const wantDetail = args?.detail === true
+        if (!wantDetail) {
+          const cv = compactMemory(mem.text)
+          log.info(`[群记忆] 自读(摘要) ${gid} → ${cv.text.length} 字 / 全文 ${mem.text.length} 字 / ${cv.sections} 节`)
+          // 超限信息在两种模式下都要报：摘要视图也要让人知道"原文其实更大、被截过"
+          const clipNote = mem.clipped
+            ? `⚠️ 记忆原文 ${mem.bytes} 字节，超过读取上限 ${mem.text.length} 字，已按整行截断；` 
+            : ''
+          return {
+            ok: true, target, group_id: gid, mode: 'summary',
+            chars: cv.text.length, full_chars: mem.text.length, sections: cv.sections,
+            ...(mem.clipped ? { clipped: true } : {}),
+            memory: cv.text,
+            hint: `${clipNote}这是摘要视图（各小节只给首行）。需要某人的完整印象或某条细节时，再调一次 read_memory 并传 detail:true 读全文。`,
+          }
+        }
+        log.info(`[群记忆] 自读(全文) ${gid} → ${mem.text.length} 字${mem.clipped ? '（已按上限截断）' : ''}`)
         return {
-          ok: true, target, group_id: gid, chars: mem.text.length, memory: mem.text,
+          ok: true, target, group_id: gid, mode: 'full', chars: mem.text.length, memory: mem.text,
           ...(mem.clipped ? { clipped: true, hint: `记忆原文 ${mem.bytes} 字节，超过读取上限，已按整行截断；需要完整内容请让人在控制台调大 maxBytes 或精简文件` } : {}),
         }
       },
@@ -268,14 +406,16 @@ export default {
       dataDirOf,
       memoryDirOf: dirOf,
       readMemoryOf: readRaw,
-      invalidateMemoryOf: (gid) => rawCache.delete(fileOf(gid)),
+      invalidateMemoryOf: (key) => rawCache.delete(fileOfKey(asKey(key))),
       maxBytesOf,
+      mutedOf,
     })
     bot.shared.memoryAccumulate = accumulator.manual
     bot.shared.memoryAccumulateStatus = accumulator.status
     bot.shared.memoryAccumulateSync = accumulator.sync
     bot.shared.memoryAccumulateSubmit = accumulator.submit
     bot.shared.memoryAccumulateStop = accumulator.stop
+    bot.shared.memoryAccumulateTickIdle = accumulator.tickIdle   // 测试/控制台：手动跑一次「聊完沉淀」扫描
     accumulator.start()
     // fiber 卸载时清掉 60s 定时器：旧版 start() 的 timer 直接丢弃，内核 dispose 也不清，
     // 插件重载会叠出第二个定时器。onDispose 是内核的新能力，老内核没有 → 可选调用。
